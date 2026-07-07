@@ -152,7 +152,7 @@ if st.button("Generate Final Results", type="primary"):
     final_sheets = {}
     for sheet_name, df in edited_data.items():
         df_final = df.copy()
-        df_final["Budget Left"] = df_final["Total PO $"] - df_final["Profit or Loss"]
+        df_final["Budget Left"] = df_final["Total PO $"] - df_final["Total Cost"]
         final_sheets[sheet_name] = add_totals_row(df_final)
     st.session_state.final_sheets = final_sheets
 
