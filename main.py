@@ -3,8 +3,13 @@ import io
 import altair as alt
 import pandas as pd
 import streamlit as st
+from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.series import DataPoint
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 STATUS_COLORS = {"Profit": "#0ca30c", "Loss": "#d03b3b"}
+STATUS_COLORS_HEX = {"Profit": "0CA30C", "Loss": "D03B3B"}  # no '#', for openpyxl
 
 st.set_page_config(page_title="Tooling Data Cleaning & Budget Tool", layout="wide")
 
@@ -119,6 +124,60 @@ def build_excel(final_sheets: dict[str, pd.DataFrame]) -> bytes:
     return buffer.getvalue()
 
 
+def build_project_summary_excel(project_summary: pd.DataFrame) -> bytes:
+    """Project summary table plus a native, editable Excel bar chart colored
+    green/red by Profit/Loss status."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        project_summary.to_excel(writer, sheet_name="Project Summary", index=False)
+        worksheet = writer.sheets["Project Summary"]
+        n_rows = len(project_summary)
+
+        header_fill = PatternFill("solid", fgColor="2A78D6")
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        currency_cols = ["Total PO $", "Total Cost", "Profit or Loss ($)"]
+        for col_name in currency_cols:
+            col_letter = get_column_letter(project_summary.columns.get_loc(col_name) + 1)
+            for row in range(2, n_rows + 2):
+                worksheet[f"{col_letter}{row}"].number_format = '"$"#,##0.00'
+
+        for i, col_name in enumerate(project_summary.columns, start=1):
+            max_len = max(project_summary[col_name].astype(str).map(len).max(), len(col_name)) + 2
+            worksheet.column_dimensions[get_column_letter(i)].width = max_len
+
+        chart = BarChart()
+        chart.type = "col"
+        chart.title = "Profit or Loss by Project"
+        chart.y_axis.title = "Profit or Loss ($)"
+        chart.x_axis.title = "File"
+        chart.legend = None
+        chart.height, chart.width = 10, 20
+
+        profit_col = project_summary.columns.get_loc("Profit or Loss ($)") + 1
+        file_col = project_summary.columns.get_loc("File") + 1
+        data = Reference(worksheet, min_col=profit_col, min_row=1, max_row=n_rows + 1)
+        cats = Reference(worksheet, min_col=file_col, min_row=2, max_row=n_rows + 1)
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+
+        series = chart.series[0]
+        series.data_points = [
+            DataPoint(idx=i, spPr=None) for i in range(n_rows)
+        ]
+        for i, status in enumerate(project_summary["Status"]):
+            point = series.data_points[i]
+            point.graphicalProperties.solidFill = STATUS_COLORS_HEX[status]
+            point.graphicalProperties.line.noFill = True
+
+        worksheet.add_chart(chart, f"{get_column_letter(len(project_summary.columns) + 2)}2")
+
+    return buffer.getvalue()
+
+
 st.title("Tooling Data Cleaning & Budget Tool")
 st.markdown(
     """
@@ -200,7 +259,9 @@ if "final_sheets" in st.session_state:
     st.header("Step 4: Profit or Loss by Project")
     st.caption("One row per uploaded file, using its TOTAL row from Step 3. Profit or Loss = Total PO $ - Total Cost.")
 
-    project_summary = build_project_summary(st.session_state.final_sheets)
+    project_summary = build_project_summary(st.session_state.final_sheets).sort_values(
+        "Profit or Loss ($)", ascending=False, ignore_index=True
+    )
 
     st.dataframe(
         project_summary,
@@ -213,16 +274,30 @@ if "final_sheets" in st.session_state:
         },
     )
 
+    st.download_button(
+        label="Download project summary as Excel",
+        data=build_project_summary_excel(project_summary),
+        file_name="project_profit_or_loss_summary.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    file_order = project_summary["File"].tolist()
+    base_font = "system-ui, -apple-system, Segoe UI, sans-serif"
+
     bars = (
         alt.Chart(project_summary)
-        .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .mark_bar(size=36, cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
         .encode(
-            x=alt.X("File:N", sort=None, title="File"),
-            y=alt.Y("Profit or Loss ($):Q", title="Profit or Loss ($)"),
+            x=alt.X("File:N", sort=file_order, title=None, axis=alt.Axis(labelAngle=0, labelColor="#52514e")),
+            y=alt.Y(
+                "Profit or Loss ($):Q",
+                title="Profit or Loss ($)",
+                axis=alt.Axis(format="$,.0f", labelColor="#898781", gridColor="#e1e0d9", titleColor="#52514e"),
+            ),
             color=alt.Color(
                 "Status:N",
                 scale=alt.Scale(domain=list(STATUS_COLORS.keys()), range=list(STATUS_COLORS.values())),
-                legend=alt.Legend(title="Status"),
+                legend=alt.Legend(title=None, orient="top", symbolType="circle"),
             ),
             tooltip=[
                 "File",
@@ -233,8 +308,33 @@ if "final_sheets" in st.session_state:
                 "Status",
             ],
         )
-        .properties(height=400)
     )
-    zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#c3c2b7").encode(y="y:Q")
+    labels = bars.mark_text(
+        dy=alt.expr("datum['Profit or Loss ($)'] >= 0 ? -8 : 14"),
+        color="#0b0b0b",
+        fontSize=12,
+        font=base_font,
+    ).encode(text=alt.Text("Profit or Loss ($):Q", format="$,.0f"))
+    zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#c3c2b7", strokeWidth=1).encode(y="y:Q")
 
-    st.altair_chart(bars + zero_line, use_container_width=True)
+    chart = (
+        (bars + zero_line + labels)
+        .properties(
+            height=380,
+            title=alt.TitleParams(
+                "Profit or Loss by Project",
+                subtitle="Total PO $ minus Total Cost, per uploaded file",
+                fontSize=16,
+                subtitleFontSize=12,
+                subtitleColor="#898781",
+                anchor="start",
+                font=base_font,
+                subtitleFont=base_font,
+            ),
+        )
+        .configure_view(strokeWidth=0)
+        .configure_axis(labelFont=base_font, titleFont=base_font, grid=True, domain=False, tickSize=0)
+        .configure_legend(labelFont=base_font, labelFontSize=12)
+    )
+
+    st.altair_chart(chart, use_container_width=True)
