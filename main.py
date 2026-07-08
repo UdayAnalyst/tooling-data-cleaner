@@ -48,7 +48,7 @@ def load_po_registry() -> dict[str, float]:
         worksheet = get_po_registry_worksheet()
         records = worksheet.get_all_records()
         return {
-            str(r["Okay PN"]): float(r["Total PO $"])
+            normalize_pn(r["Okay PN"]): float(r["Total PO $"])
             for r in records
             if str(r.get("Okay PN", "")).strip() != ""
         }
@@ -101,6 +101,14 @@ NUMERIC_TOTAL_COLS = [
     "Total PO $",
     "Budget Left",
 ]
+
+
+def normalize_pn(value) -> str:
+    """Normalizes Okay PN for registry matching: trims whitespace, collapses
+    internal whitespace, strips a trailing dash (Plex exports sometimes add
+    one, e.g. '932 A PD-01-' vs '932 A PD-01'), and ignores case."""
+    text = re.sub(r"\s+", " ", str(value).strip().upper())
+    return text.rstrip("- ")
 
 
 def consolidate_duplicates(df: pd.DataFrame) -> pd.DataFrame:
@@ -287,7 +295,7 @@ if st.session_state.get("uploaded_names") != uploaded_names:
     st.session_state.missing_report = missing_report
     st.session_state.editor_data = {
         name: df.assign(
-            **{"Total PO $": df["Okay PN"].astype(str).map(po_registry).fillna(0.0)}
+            **{"Total PO $": df["Okay PN"].map(normalize_pn).map(po_registry).fillna(0.0)}
         )
         for name, df in processed.items()
     }
@@ -335,7 +343,7 @@ if st.button("Generate Final Results", type="primary"):
     if st.session_state.get("registry_connected"):
         registry = load_po_registry()
         for df in edited_data.values():
-            updates = dict(zip(df["Okay PN"].astype(str), df["Total PO $"]))
+            updates = dict(zip(df["Okay PN"].map(normalize_pn), df["Total PO $"]))
             registry.update(updates)
         if save_po_registry(registry):
             st.toast(f"Saved {len(registry)} PO $ value(s) to the registry for next time.", icon="✅")
