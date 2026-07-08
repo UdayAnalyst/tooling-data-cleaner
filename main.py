@@ -87,18 +87,28 @@ def add_totals_row(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_project_summary(final_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Collate every uploaded project's rows (across all sheets) by Tooling Job
-    No. and compute overall Profit or Loss = Total PO $ - Total Cost."""
-    combined = pd.concat(
-        [df[df[df.columns[0]] != "TOTAL"] for df in final_sheets.values()],
-        ignore_index=True,
-    )
-    combined["Tooling Job No."] = combined["Tooling Job No."].astype(str)
+    """One row per uploaded file, reusing each file's existing TOTAL row from
+    Step 3. If a file contains multiple unique Tooling Job No. values, they are
+    joined with '/'."""
+    rows = []
+    for sheet_name, df in final_sheets.items():
+        data_rows = df[df[df.columns[0]] != "TOTAL"]
+        totals_row = df.iloc[-1]
+        job_numbers = data_rows["Tooling Job No."].astype(str).unique()
 
-    summary = combined.groupby("Tooling Job No.", as_index=False)[["Total PO $", "Total Cost"]].sum()
+        rows.append(
+            {
+                "File": sheet_name,
+                "Tooling Job No.": "/".join(job_numbers),
+                "Total PO $": totals_row["Total PO $"],
+                "Total Cost": totals_row["Total Cost"],
+            }
+        )
+
+    summary = pd.DataFrame(rows)
     summary["Profit or Loss ($)"] = summary["Total PO $"] - summary["Total Cost"]
     summary["Status"] = summary["Profit or Loss ($)"].apply(lambda v: "Profit" if v >= 0 else "Loss")
-    return summary.sort_values("Profit or Loss ($)", ascending=False, ignore_index=True)
+    return summary
 
 
 def build_excel(final_sheets: dict[str, pd.DataFrame]) -> bytes:
@@ -188,7 +198,7 @@ if "final_sheets" in st.session_state:
     )
 
     st.header("Step 4: Profit or Loss by Project")
-    st.caption("Collated across every uploaded file/sheet by Tooling Job No. Profit or Loss = Total PO $ - Total Cost.")
+    st.caption("One row per uploaded file, using its TOTAL row from Step 3. Profit or Loss = Total PO $ - Total Cost.")
 
     project_summary = build_project_summary(st.session_state.final_sheets)
 
@@ -207,7 +217,7 @@ if "final_sheets" in st.session_state:
         alt.Chart(project_summary)
         .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
         .encode(
-            x=alt.X("Tooling Job No.:N", sort=None, title="Project (Tooling Job No.)"),
+            x=alt.X("File:N", sort=None, title="File"),
             y=alt.Y("Profit or Loss ($):Q", title="Profit or Loss ($)"),
             color=alt.Color(
                 "Status:N",
@@ -215,6 +225,7 @@ if "final_sheets" in st.session_state:
                 legend=alt.Legend(title="Status"),
             ),
             tooltip=[
+                "File",
                 "Tooling Job No.",
                 alt.Tooltip("Total PO $:Q", format="$,.2f"),
                 alt.Tooltip("Total Cost:Q", format="$,.2f"),
