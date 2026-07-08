@@ -263,6 +263,15 @@ if "final_sheets" in st.session_state:
         "Profit or Loss ($)", ascending=False, ignore_index=True
     )
 
+    total_open_projects = len(project_summary)
+    projects_on_budget = int((project_summary["Status"] == "Profit").sum())
+    pct_on_budget = (projects_on_budget / total_open_projects * 100) if total_open_projects else 0
+
+    kpi1, kpi2, kpi3 = st.columns(3)
+    kpi1.metric("Current % on Budget", f"{pct_on_budget:.0f}%")
+    kpi2.metric("Projects On Budget", projects_on_budget)
+    kpi3.metric("Total Open Projects", total_open_projects)
+
     st.dataframe(
         project_summary,
         use_container_width=True,
