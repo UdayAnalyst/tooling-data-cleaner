@@ -75,6 +75,90 @@ def save_po_registry(registry: dict[str, float]) -> bool:
     except Exception:
         return False
 
+
+PROJECT_REGISTRY_HEADERS = [
+    "Customer",
+    "Project",
+    "Part Number",
+    "Contingency/Management Reserve Used",
+    "Expected Project End Date",
+    "NOTES",
+]
+
+
+def get_project_registry_worksheet():
+    import gspread
+
+    client = get_gsheet_client()
+    sheet = client.open_by_key(st.secrets["po_registry_sheet_id"])
+    try:
+        return sheet.worksheet("Project Registry")
+    except gspread.WorksheetNotFound:
+        worksheet = sheet.add_worksheet(
+            title="Project Registry", rows=200, cols=len(PROJECT_REGISTRY_HEADERS)
+        )
+        worksheet.append_row(PROJECT_REGISTRY_HEADERS)
+        return worksheet
+
+
+def load_project_registry() -> pd.DataFrame:
+    """Reads the hand-maintained Customer/Project/Part Number/Contingency/
+    Expected End Date/NOTES rows. Project Balance is computed separately, not
+    stored here. Returns an empty frame if Google Sheets isn't configured."""
+    try:
+        worksheet = get_project_registry_worksheet()
+        records = worksheet.get_all_records()
+        if not records:
+            return pd.DataFrame(columns=PROJECT_REGISTRY_HEADERS)
+        return pd.DataFrame(records)
+    except Exception:
+        return pd.DataFrame(columns=PROJECT_REGISTRY_HEADERS)
+
+
+def parse_part_numbers(value) -> list[str]:
+    """'931, 932, 985, 988' -> ['931', '932', '985', '988'], de-duplicated."""
+    parts = re.split(r"[,\s]+", str(value).strip())
+    seen = []
+    for part in parts:
+        if part and part not in seen:
+            seen.append(part)
+    return seen
+
+
+def build_prefix_balances(final_sheets: dict[str, pd.DataFrame]) -> dict[str, float]:
+    """Sums each row's Budget Left across every uploaded file, grouped by
+    Okay PN prefix (same prefix used for the Step 4 'Project' label)."""
+    combined = pd.concat(
+        [df[df[df.columns[0]] != "TOTAL"] for df in final_sheets.values()],
+        ignore_index=True,
+    )
+    prefixes = combined["Okay PN"].dropna().astype(str).map(extract_pn_prefix)
+    return combined.assign(_prefix=prefixes).groupby("_prefix")["Budget Left"].sum().to_dict()
+
+
+def build_open_projects(final_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Joins the hand-maintained Project Registry with a live-computed
+    Project Balance (sum of Budget Left for that row's Part Number(s))."""
+    registry_df = load_project_registry()
+    if registry_df.empty:
+        return registry_df.assign(**{"Project Balance": pd.Series(dtype=float)})
+
+    prefix_balances = build_prefix_balances(final_sheets)
+    registry_df["Project Balance"] = registry_df["Part Number"].apply(
+        lambda pn: sum(prefix_balances.get(n, 0.0) for n in parse_part_numbers(pn))
+    )
+    ordered_cols = [
+        "Customer",
+        "Project",
+        "Part Number",
+        "Project Balance",
+        "Contingency/Management Reserve Used",
+        "Expected Project End Date",
+        "NOTES",
+    ]
+    return registry_df[ordered_cols]
+
+
 st.set_page_config(page_title="Tooling Data Cleaning & Budget Tool", layout="wide")
 
 REQUIRED_COLUMNS = [
@@ -455,3 +539,27 @@ if "final_sheets" in st.session_state:
     )
 
     st.altair_chart(chart, use_container_width=True)
+
+    st.header("Step 5: Open Projects")
+    st.caption(
+        "Customer, Project, Part Number, Contingency/Management Reserve Used, Expected Project End Date "
+        "and NOTES are maintained by hand in the 'Project Registry' tab of your Google Sheet. "
+        "Project Balance is computed live: sum of Budget Left for that row's Part Number(s)."
+    )
+
+    if not st.session_state.get("registry_connected"):
+        st.warning("PO $ registry isn't connected, so Open Projects can't be computed. See PO_REGISTRY_SETUP.md.")
+    else:
+        open_projects = build_open_projects(st.session_state.final_sheets)
+        if open_projects.empty:
+            st.info(
+                "No rows yet in the 'Project Registry' tab. Add Customer / Project / Part Number rows "
+                "there and they'll show up here with Project Balance filled in automatically."
+            )
+        else:
+            st.dataframe(
+                open_projects,
+                use_container_width=True,
+                hide_index=True,
+                column_config={"Project Balance": st.column_config.NumberColumn(format="$%.2f")},
+            )
