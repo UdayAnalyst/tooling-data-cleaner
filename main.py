@@ -1,4 +1,5 @@
 import io
+import re
 
 import altair as alt
 import pandas as pd
@@ -91,19 +92,28 @@ def add_totals_row(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df, pd.DataFrame([totals])], ignore_index=True)
 
 
+def extract_pn_prefix(value: str) -> str:
+    """Leading run of letters/digits, stopping at the first dash, dot, space,
+    underscore, etc. — e.g. '924-1' and '924-01' both become '924'."""
+    match = re.match(r"^[A-Za-z0-9]+", value)
+    return match.group(0) if match else value
+
+
 def build_project_summary(final_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """One row per uploaded file, reusing each file's existing TOTAL row from
-    Step 3. If a file contains multiple unique Tooling Job No. values, they are
-    joined with '/'."""
+    Step 3. If a file contains multiple unique Tooling Job No. (or Okay PN
+    prefix) values, they are joined with '/'."""
     rows = []
     for sheet_name, df in final_sheets.items():
         data_rows = df[df[df.columns[0]] != "TOTAL"]
         totals_row = df.iloc[-1]
         job_numbers = data_rows["Tooling Job No."].dropna().astype(str).unique()
+        pn_prefixes = data_rows["Okay PN"].dropna().astype(str).map(extract_pn_prefix).unique()
 
         rows.append(
             {
                 "File": sheet_name,
+                "Project": "/".join(pn_prefixes),
                 "Tooling Job No.": "/".join(job_numbers),
                 "Total PO $": totals_row["Total PO $"],
                 "Total Cost": totals_row["Total Cost"],
@@ -153,14 +163,14 @@ def build_project_summary_excel(project_summary: pd.DataFrame) -> bytes:
         chart.type = "col"
         chart.title = "Profit or Loss by Project"
         chart.y_axis.title = "Profit or Loss ($)"
-        chart.x_axis.title = "File"
+        chart.x_axis.title = "Project"
         chart.legend = None
         chart.height, chart.width = 10, 20
 
         profit_col = project_summary.columns.get_loc("Profit or Loss ($)") + 1
-        file_col = project_summary.columns.get_loc("File") + 1
+        project_col = project_summary.columns.get_loc("Project") + 1
         data = Reference(worksheet, min_col=profit_col, min_row=1, max_row=n_rows + 1)
-        cats = Reference(worksheet, min_col=file_col, min_row=2, max_row=n_rows + 1)
+        cats = Reference(worksheet, min_col=project_col, min_row=2, max_row=n_rows + 1)
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
 
@@ -290,14 +300,14 @@ if "final_sheets" in st.session_state:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    file_order = project_summary["File"].tolist()
+    project_order = project_summary["Project"].tolist()
     base_font = "system-ui, -apple-system, Segoe UI, sans-serif"
 
     bars = (
         alt.Chart(project_summary)
         .mark_bar(size=36, cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
         .encode(
-            x=alt.X("File:N", sort=file_order, title=None, axis=alt.Axis(labelAngle=0, labelColor="#52514e")),
+            x=alt.X("Project:N", sort=project_order, title=None, axis=alt.Axis(labelAngle=0, labelColor="#52514e")),
             y=alt.Y(
                 "Profit or Loss ($):Q",
                 title="Profit or Loss ($)",
@@ -309,6 +319,7 @@ if "final_sheets" in st.session_state:
                 legend=alt.Legend(title=None, orient="top", symbolType="circle"),
             ),
             tooltip=[
+                "Project",
                 "File",
                 "Tooling Job No.",
                 alt.Tooltip("Total PO $:Q", format="$,.2f"),
