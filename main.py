@@ -94,7 +94,7 @@ def build_project_summary(final_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame
     for sheet_name, df in final_sheets.items():
         data_rows = df[df[df.columns[0]] != "TOTAL"]
         totals_row = df.iloc[-1]
-        job_numbers = data_rows["Tooling Job No."].astype(str).unique()
+        job_numbers = data_rows["Tooling Job No."].dropna().astype(str).unique()
 
         rows.append(
             {
