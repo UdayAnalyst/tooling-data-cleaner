@@ -1,7 +1,10 @@
 import io
 
+import altair as alt
 import pandas as pd
 import streamlit as st
+
+STATUS_COLORS = {"Profit": "#0ca30c", "Loss": "#d03b3b"}
 
 st.set_page_config(page_title="Tooling Data Cleaning & Budget Tool", layout="wide")
 
@@ -81,6 +84,21 @@ def add_totals_row(df: pd.DataFrame) -> pd.DataFrame:
     totals = {col: (df[col].sum() if col in NUMERIC_TOTAL_COLS else "") for col in df.columns}
     totals[df.columns[0]] = "TOTAL"
     return pd.concat([df, pd.DataFrame([totals])], ignore_index=True)
+
+
+def build_project_summary(final_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Collate every uploaded project's rows (across all sheets) by Tooling Job
+    No. and compute overall Profit or Loss = Total PO $ - Total Cost."""
+    combined = pd.concat(
+        [df[df[df.columns[0]] != "TOTAL"] for df in final_sheets.values()],
+        ignore_index=True,
+    )
+    combined["Tooling Job No."] = combined["Tooling Job No."].astype(str)
+
+    summary = combined.groupby("Tooling Job No.", as_index=False)[["Total PO $", "Total Cost"]].sum()
+    summary["Profit or Loss ($)"] = summary["Total PO $"] - summary["Total Cost"]
+    summary["Status"] = summary["Profit or Loss ($)"].apply(lambda v: "Profit" if v >= 0 else "Loss")
+    return summary.sort_values("Profit or Loss ($)", ascending=False, ignore_index=True)
 
 
 def build_excel(final_sheets: dict[str, pd.DataFrame]) -> bytes:
@@ -168,3 +186,44 @@ if "final_sheets" in st.session_state:
         file_name="tooling_cleaned_all_sheets.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    st.header("Step 4: Profit or Loss by Project")
+    st.caption("Collated across every uploaded file/sheet by Tooling Job No. Profit or Loss = Total PO $ - Total Cost.")
+
+    project_summary = build_project_summary(st.session_state.final_sheets)
+
+    st.dataframe(
+        project_summary,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Total PO $": st.column_config.NumberColumn(format="$%.2f"),
+            "Total Cost": st.column_config.NumberColumn(format="$%.2f"),
+            "Profit or Loss ($)": st.column_config.NumberColumn(format="$%.2f"),
+        },
+    )
+
+    bars = (
+        alt.Chart(project_summary)
+        .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=alt.X("Tooling Job No.:N", sort=None, title="Project (Tooling Job No.)"),
+            y=alt.Y("Profit or Loss ($):Q", title="Profit or Loss ($)"),
+            color=alt.Color(
+                "Status:N",
+                scale=alt.Scale(domain=list(STATUS_COLORS.keys()), range=list(STATUS_COLORS.values())),
+                legend=alt.Legend(title="Status"),
+            ),
+            tooltip=[
+                "Tooling Job No.",
+                alt.Tooltip("Total PO $:Q", format="$,.2f"),
+                alt.Tooltip("Total Cost:Q", format="$,.2f"),
+                alt.Tooltip("Profit or Loss ($):Q", format="$,.2f"),
+                "Status",
+            ],
+        )
+        .properties(height=400)
+    )
+    zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#c3c2b7").encode(y="y:Q")
+
+    st.altair_chart(bars + zero_line, use_container_width=True)
