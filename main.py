@@ -12,6 +12,69 @@ from openpyxl.utils import get_column_letter
 STATUS_COLORS = {"Profit": "#0ca30c", "Loss": "#d03b3b"}
 STATUS_COLORS_HEX = {"Profit": "0CA30C", "Loss": "D03B3B"}  # no '#', for openpyxl
 
+PO_REGISTRY_HEADERS = ["Okay PN", "Total PO $"]
+GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+
+@st.cache_resource
+def get_gsheet_client():
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=GSHEET_SCOPES
+    )
+    return gspread.authorize(creds)
+
+
+def get_po_registry_worksheet():
+    import gspread
+
+    client = get_gsheet_client()
+    sheet = client.open_by_key(st.secrets["po_registry_sheet_id"])
+    try:
+        return sheet.worksheet("PO Registry")
+    except gspread.WorksheetNotFound:
+        worksheet = sheet.add_worksheet(title="PO Registry", rows=1000, cols=2)
+        worksheet.append_row(PO_REGISTRY_HEADERS)
+        return worksheet
+
+
+def load_po_registry() -> dict[str, float]:
+    """Returns {Okay PN: Total PO $} remembered from previous days. Returns an
+    empty registry (rather than raising) if Google Sheets isn't configured, so
+    the app still works without it — see PO_REGISTRY_SETUP.md."""
+    try:
+        worksheet = get_po_registry_worksheet()
+        records = worksheet.get_all_records()
+        return {
+            str(r["Okay PN"]): float(r["Total PO $"])
+            for r in records
+            if str(r.get("Okay PN", "")).strip() != ""
+        }
+    except Exception:
+        return {}
+
+
+def is_registry_configured() -> bool:
+    try:
+        return "gcp_service_account" in st.secrets
+    except Exception:
+        return False
+
+
+def save_po_registry(registry: dict[str, float]) -> bool:
+    """Overwrites the registry sheet with the given {Okay PN: Total PO $} map.
+    Returns False (without raising) if Google Sheets isn't configured."""
+    try:
+        worksheet = get_po_registry_worksheet()
+        worksheet.clear()
+        rows = [PO_REGISTRY_HEADERS] + [[k, v] for k, v in registry.items()]
+        worksheet.update(rows)
+        return True
+    except Exception:
+        return False
+
 st.set_page_config(page_title="Tooling Data Cleaning & Budget Tool", layout="wide")
 
 REQUIRED_COLUMNS = [
@@ -217,10 +280,16 @@ if st.session_state.get("uploaded_names") != uploaded_names:
             continue
         processed[sheet_name] = consolidate_duplicates(df)
 
+    po_registry = load_po_registry()
+    st.session_state.registry_connected = is_registry_configured()
+
     st.session_state.uploaded_names = uploaded_names
     st.session_state.missing_report = missing_report
     st.session_state.editor_data = {
-        name: df.assign(**{"Total PO $": 0.0}) for name, df in processed.items()
+        name: df.assign(
+            **{"Total PO $": df["Okay PN"].astype(str).map(po_registry).fillna(0.0)}
+        )
+        for name, df in processed.items()
     }
     st.session_state.pop("final_sheets", None)
 
@@ -232,7 +301,17 @@ if not st.session_state.editor_data:
 
 st.success(f"Loaded {len(st.session_state.editor_data)} sheet(s) after cleaning duplicates.")
 st.header("Step 2: Enter Total PO $ for each row")
-st.caption("Only the 'Total PO $' column is editable — all other columns are shown read-only for context.")
+if st.session_state.get("registry_connected"):
+    st.caption(
+        "Only the 'Total PO $' column is editable. Values already seen for an Okay PN are "
+        "pre-filled from your saved registry — just correct the ones that changed."
+    )
+else:
+    st.caption("Only the 'Total PO $' column is editable — all other columns are shown read-only for context.")
+    st.warning(
+        "PO $ registry isn't connected yet, so values aren't being remembered day to day. "
+        "See PO_REGISTRY_SETUP.md to enable it."
+    )
 
 edited_data = {}
 for sheet_name, df in st.session_state.editor_data.items():
@@ -252,6 +331,16 @@ if st.button("Generate Final Results", type="primary"):
         df_final["Budget Left"] = df_final["Total PO $"] - df_final["Total Cost"]
         final_sheets[sheet_name] = add_totals_row(df_final)
     st.session_state.final_sheets = final_sheets
+
+    if st.session_state.get("registry_connected"):
+        registry = load_po_registry()
+        for df in edited_data.values():
+            updates = dict(zip(df["Okay PN"].astype(str), df["Total PO $"]))
+            registry.update(updates)
+        if save_po_registry(registry):
+            st.toast(f"Saved {len(registry)} PO $ value(s) to the registry for next time.", icon="✅")
+        else:
+            st.warning("Couldn't save to the PO $ registry — values won't be remembered next time.")
 
 if "final_sheets" in st.session_state:
     st.header("Step 3: Final Results")
