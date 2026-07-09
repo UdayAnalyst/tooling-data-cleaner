@@ -392,11 +392,26 @@ if not st.session_state.editor_data:
     st.stop()
 
 st.success(f"Loaded {len(st.session_state.editor_data)} sheet(s) after cleaning duplicates.")
-st.header("Step 2: Enter Total PO $ for each row")
+st.session_state.setdefault("registry_version", 0)
+
+step2_header, step2_button = st.columns([4, 1])
+with step2_header:
+    st.header("Step 2: Enter Total PO $ for each row")
 if st.session_state.get("registry_connected"):
+    with step2_button:
+        if st.button("Refresh from registry"):
+            fresh_registry = load_po_registry()
+            for name, df in st.session_state.editor_data.items():
+                st.session_state.editor_data[name] = df.assign(
+                    **{"Total PO $": df["Okay PN"].map(normalize_pn).map(fresh_registry).fillna(df["Total PO $"])}
+                )
+            st.session_state.registry_version += 1
+            st.rerun()
     st.caption(
         "Only the 'Total PO $' column is editable. Values already seen for an Okay PN are "
-        "pre-filled from your saved registry — just correct the ones that changed."
+        "pre-filled from your saved registry — just correct the ones that changed. If you edited "
+        "the registry in Google Sheets after uploading, click 'Refresh from registry' to pull the "
+        "latest values in without needing to re-upload."
     )
 else:
     st.caption("Only the 'Total PO $' column is editable — all other columns are shown read-only for context.")
@@ -410,7 +425,7 @@ for sheet_name, df in st.session_state.editor_data.items():
     st.subheader(sheet_name)
     edited_data[sheet_name] = st.data_editor(
         df,
-        key=f"editor_{sheet_name}",
+        key=f"editor_{sheet_name}_{st.session_state.registry_version}",
         disabled=[c for c in df.columns if c != "Total PO $"],
         use_container_width=True,
         num_rows="fixed",
@@ -426,8 +441,10 @@ if st.button("Generate Final Results", type="primary"):
 
     if st.session_state.get("registry_connected"):
         registry = load_po_registry()
-        for df in edited_data.values():
-            updates = dict(zip(df["Okay PN"].map(normalize_pn), df["Total PO $"]))
+        for sheet_name, df in edited_data.items():
+            baseline = st.session_state.editor_data[sheet_name]
+            changed = df[df["Total PO $"] != baseline["Total PO $"]]
+            updates = dict(zip(changed["Okay PN"].map(normalize_pn), changed["Total PO $"]))
             registry.update(updates)
         if save_po_registry(registry):
             st.toast(f"Saved {len(registry)} PO $ value(s) to the registry for next time.", icon="✅")
