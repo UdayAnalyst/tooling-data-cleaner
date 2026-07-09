@@ -14,6 +14,7 @@ STATUS_COLORS_HEX = {"Profit": "0CA30C", "Loss": "D03B3B"}  # no '#', for openpy
 
 PO_REGISTRY_HEADERS = ["Okay PN", "Total PO $"]
 GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 
 @st.cache_resource
@@ -74,6 +75,59 @@ def save_po_registry(registry: dict[str, float]) -> bool:
         return True
     except Exception:
         return False
+
+
+@st.cache_resource
+def get_drive_session():
+    """An authenticated HTTP session for the Google Drive API, reusing the same
+    service account as the PO/Project registries — just needs Drive scope added."""
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2.service_account import Credentials
+
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=GDRIVE_SCOPES
+    )
+    return AuthorizedSession(creds)
+
+
+def is_drive_configured() -> bool:
+    try:
+        return "gcp_service_account" in st.secrets and "gdrive_folder_id" in st.secrets
+    except Exception:
+        return False
+
+
+def list_drive_files() -> list[dict]:
+    """Lists CSV/Excel files in the configured Google Drive folder."""
+    session = get_drive_session()
+    folder_id = st.secrets["gdrive_folder_id"]
+    response = session.get(
+        "https://www.googleapis.com/drive/v3/files",
+        params={
+            "q": f"'{folder_id}' in parents and trashed = false",
+            "fields": "files(id, name)",
+        },
+    )
+    response.raise_for_status()
+    files = response.json().get("files", [])
+    return [f for f in files if f["name"].lower().endswith((".csv", ".xlsx", ".xls"))]
+
+
+def fetch_drive_files() -> list[io.BytesIO]:
+    """Downloads every CSV/Excel file in the configured Google Drive folder, returning
+    file-like objects with a `.name` attribute — a drop-in replacement for
+    Streamlit's uploaded-file objects, compatible with load_all_sheets()."""
+    session = get_drive_session()
+    buffers = []
+    for item in list_drive_files():
+        response = session.get(
+            f"https://www.googleapis.com/drive/v3/files/{item['id']}", params={"alt": "media"}
+        )
+        response.raise_for_status()
+        buffer = io.BytesIO(response.content)
+        buffer.name = item["name"]
+        buffers.append(buffer)
+    return buffers
 
 
 PROJECT_REGISTRY_HEADERS = [
@@ -344,21 +398,35 @@ def build_project_summary_excel(project_summary: pd.DataFrame) -> bytes:
 
 
 st.title("Tooling Data Cleaning & Budget Tool")
-st.markdown(
-    """
-1. Upload one or more CSV/Excel files.
-2. Enter **Total PO $** for each row directly in the table — every other column stays visible so you always know which row you're entering.
-3. Click **Generate Final Results** to calculate Budget Left, add column totals, and download the finished workbook.
-"""
-)
 
-uploaded_files = st.file_uploader(
-    "Upload CSV or Excel file(s)", type=["csv", "xlsx", "xls"], accept_multiple_files=True
-)
+if is_drive_configured():
+    header_col, button_col = st.columns([4, 1])
+    with header_col:
+        st.caption("Files are fetched automatically from the configured Google Drive folder.")
+    with button_col:
+        if st.button("Refresh from Drive"):
+            st.session_state.pop("drive_files", None)
+            st.session_state.pop("uploaded_names", None)
 
-if not uploaded_files:
-    st.info("Upload a file to get started.")
-    st.stop()
+    if "drive_files" not in st.session_state:
+        with st.spinner("Fetching files from Google Drive..."):
+            try:
+                st.session_state.drive_files = fetch_drive_files()
+            except Exception as e:
+                st.error(f"Couldn't fetch files from Google Drive: {e}")
+                st.session_state.drive_files = []
+
+    uploaded_files = st.session_state.drive_files
+    if not uploaded_files:
+        st.info("No CSV/Excel files found in the configured Google Drive folder.")
+        st.stop()
+else:
+    uploaded_files = st.file_uploader(
+        "Upload CSV or Excel file(s)", type=["csv", "xlsx", "xls"], accept_multiple_files=True
+    )
+    if not uploaded_files:
+        st.info("Upload a file to get started, or see GDRIVE_SETUP.md to fetch automatically instead.")
+        st.stop()
 
 uploaded_names = [f.name for f in uploaded_files]
 if st.session_state.get("uploaded_names") != uploaded_names:

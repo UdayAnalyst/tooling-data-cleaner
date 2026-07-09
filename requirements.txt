@@ -4,3 +4,4 @@ openpyxl
 altair
 gspread
 google-auth
+requests
