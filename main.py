@@ -435,131 +435,135 @@ if st.button("Generate Final Results", type="primary"):
             st.warning("Couldn't save to the PO $ registry — values won't be remembered next time.")
 
 if "final_sheets" in st.session_state:
-    st.header("Step 3: Final Results")
-    for sheet_name, df_final in st.session_state.final_sheets.items():
-        st.subheader(sheet_name)
-        st.dataframe(df_final, use_container_width=True)
+    tab_data, tab_report = st.tabs(["Data Cleaning", "Report"])
 
-    st.download_button(
-        label="Download all sheets as Excel",
-        data=build_excel(st.session_state.final_sheets),
-        file_name="tooling_cleaned_all_sheets.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    with tab_data:
+        st.header("Step 3: Final Results")
+        for sheet_name, df_final in st.session_state.final_sheets.items():
+            st.subheader(sheet_name)
+            st.dataframe(df_final, use_container_width=True)
 
-    st.header("Step 4: Profit or Loss by Project")
-    st.caption("One row per uploaded file, using its TOTAL row from Step 3. Profit or Loss = Total PO $ - Total Cost.")
-
-    project_summary = build_project_summary(st.session_state.final_sheets).sort_values(
-        "Profit or Loss ($)", ascending=False, ignore_index=True
-    )
-
-    total_open_projects = len(project_summary)
-    projects_on_budget = int((project_summary["Status"] == "Profit").sum())
-    pct_on_budget = (projects_on_budget / total_open_projects * 100) if total_open_projects else 0
-
-    kpi1, kpi2, kpi3 = st.columns(3)
-    kpi1.metric("Current % on Budget", f"{pct_on_budget:.0f}%")
-    kpi2.metric("Projects On Budget", projects_on_budget)
-    kpi3.metric("Total Open Projects", total_open_projects)
-
-    st.dataframe(
-        project_summary,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Total PO $": st.column_config.NumberColumn(format="$%.2f"),
-            "Total Cost": st.column_config.NumberColumn(format="$%.2f"),
-            "Profit or Loss ($)": st.column_config.NumberColumn(format="$%.2f"),
-        },
-    )
-
-    st.download_button(
-        label="Download project summary as Excel",
-        data=build_project_summary_excel(project_summary),
-        file_name="project_profit_or_loss_summary.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    project_order = project_summary["Project"].tolist()
-    base_font = "system-ui, -apple-system, Segoe UI, sans-serif"
-
-    bars = (
-        alt.Chart(project_summary)
-        .mark_bar(size=36, cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
-        .encode(
-            x=alt.X("Project:N", sort=project_order, title=None, axis=alt.Axis(labelAngle=0, labelColor="#52514e")),
-            y=alt.Y(
-                "Profit or Loss ($):Q",
-                title="Profit or Loss ($)",
-                axis=alt.Axis(format="$,.0f", labelColor="#898781", gridColor="#e1e0d9", titleColor="#52514e"),
-            ),
-            color=alt.Color(
-                "Status:N",
-                scale=alt.Scale(domain=list(STATUS_COLORS.keys()), range=list(STATUS_COLORS.values())),
-                legend=alt.Legend(title=None, orient="top", symbolType="circle"),
-            ),
-            tooltip=[
-                "Project",
-                "File",
-                "Tooling Job No.",
-                alt.Tooltip("Total PO $:Q", format="$,.2f"),
-                alt.Tooltip("Total Cost:Q", format="$,.2f"),
-                alt.Tooltip("Profit or Loss ($):Q", format="$,.2f"),
-                "Status",
-            ],
+        st.download_button(
+            label="Download all sheets as Excel",
+            data=build_excel(st.session_state.final_sheets),
+            file_name="tooling_cleaned_all_sheets.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-    )
-    labels = bars.mark_text(
-        dy=alt.expr("datum['Profit or Loss ($)'] >= 0 ? -8 : 14"),
-        color="#0b0b0b",
-        fontSize=12,
-        font=base_font,
-    ).encode(text=alt.Text("Profit or Loss ($):Q", format="$,.0f"))
-    zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#c3c2b7", strokeWidth=1).encode(y="y:Q")
 
-    chart = (
-        (bars + zero_line + labels)
-        .properties(
-            height=380,
-            title=alt.TitleParams(
-                "Profit or Loss by Project",
-                subtitle="Total PO $ minus Total Cost, per uploaded file",
-                fontSize=16,
-                subtitleFontSize=12,
-                subtitleColor="#898781",
-                anchor="start",
-                font=base_font,
-                subtitleFont=base_font,
-            ),
+    with tab_report:
+        st.header("Step 4: Profit or Loss by Project")
+        st.caption("One row per uploaded file, using its TOTAL row from Step 3. Profit or Loss = Total PO $ - Total Cost.")
+
+        project_summary = build_project_summary(st.session_state.final_sheets).sort_values(
+            "Profit or Loss ($)", ascending=False, ignore_index=True
         )
-        .configure_view(strokeWidth=0)
-        .configure_axis(labelFont=base_font, titleFont=base_font, grid=True, domain=False, tickSize=0)
-        .configure_legend(labelFont=base_font, labelFontSize=12)
-    )
 
-    st.altair_chart(chart, use_container_width=True)
+        total_open_projects = len(project_summary)
+        projects_on_budget = int((project_summary["Status"] == "Profit").sum())
+        pct_on_budget = (projects_on_budget / total_open_projects * 100) if total_open_projects else 0
 
-    st.header("Step 5: Open Projects")
-    st.caption(
-        "Customer, Project, Part Number, Contingency/Management Reserve Used, Expected Project End Date "
-        "and NOTES are maintained by hand in the 'Project Registry' tab of your Google Sheet. "
-        "Project Balance is computed live: sum of Budget Left for that row's Part Number(s)."
-    )
+        kpi1, kpi2, kpi3 = st.columns(3)
+        kpi1.metric("Current % on Budget", f"{pct_on_budget:.0f}%")
+        kpi2.metric("Projects On Budget", projects_on_budget)
+        kpi3.metric("Total Open Projects", total_open_projects)
 
-    if not st.session_state.get("registry_connected"):
-        st.warning("PO $ registry isn't connected, so Open Projects can't be computed. See PO_REGISTRY_SETUP.md.")
-    else:
-        open_projects = build_open_projects(st.session_state.final_sheets)
-        if open_projects.empty:
-            st.info(
-                "No rows yet in the 'Project Registry' tab. Add Customer / Project / Part Number rows "
-                "there and they'll show up here with Project Balance filled in automatically."
+        st.dataframe(
+            project_summary,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Total PO $": st.column_config.NumberColumn(format="$%.2f"),
+                "Total Cost": st.column_config.NumberColumn(format="$%.2f"),
+                "Profit or Loss ($)": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
+
+        st.download_button(
+            label="Download project summary as Excel",
+            data=build_project_summary_excel(project_summary),
+            file_name="project_profit_or_loss_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        project_order = project_summary["Project"].tolist()
+        base_font = "system-ui, -apple-system, Segoe UI, sans-serif"
+
+        bars = (
+            alt.Chart(project_summary)
+            .mark_bar(size=36, cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
+            .encode(
+                x=alt.X("Project:N", sort=project_order, title=None, axis=alt.Axis(labelAngle=0, labelColor="#52514e")),
+                y=alt.Y(
+                    "Profit or Loss ($):Q",
+                    title="Profit or Loss ($)",
+                    axis=alt.Axis(format="$,.0f", labelColor="#898781", gridColor="#e1e0d9", titleColor="#52514e"),
+                ),
+                color=alt.Color(
+                    "Status:N",
+                    scale=alt.Scale(domain=list(STATUS_COLORS.keys()), range=list(STATUS_COLORS.values())),
+                    legend=alt.Legend(title=None, orient="top", symbolType="circle"),
+                ),
+                tooltip=[
+                    "Project",
+                    "File",
+                    "Tooling Job No.",
+                    alt.Tooltip("Total PO $:Q", format="$,.2f"),
+                    alt.Tooltip("Total Cost:Q", format="$,.2f"),
+                    alt.Tooltip("Profit or Loss ($):Q", format="$,.2f"),
+                    "Status",
+                ],
             )
+        )
+        labels = bars.mark_text(
+            dy=alt.expr("datum['Profit or Loss ($)'] >= 0 ? -8 : 14"),
+            color="#0b0b0b",
+            fontSize=12,
+            font=base_font,
+        ).encode(text=alt.Text("Profit or Loss ($):Q", format="$,.0f"))
+        zero_line = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#c3c2b7", strokeWidth=1).encode(y="y:Q")
+
+        chart = (
+            (bars + zero_line + labels)
+            .properties(
+                height=380,
+                title=alt.TitleParams(
+                    "Profit or Loss by Project",
+                    subtitle="Total PO $ minus Total Cost, per uploaded file",
+                    fontSize=16,
+                    subtitleFontSize=12,
+                    subtitleColor="#898781",
+                    anchor="start",
+                    font=base_font,
+                    subtitleFont=base_font,
+                ),
+            )
+            .configure_view(strokeWidth=0)
+            .configure_axis(labelFont=base_font, titleFont=base_font, grid=True, domain=False, tickSize=0)
+            .configure_legend(labelFont=base_font, labelFontSize=12)
+        )
+
+        st.altair_chart(chart, use_container_width=True)
+
+        st.header("Step 5: Open Projects")
+        st.caption(
+            "Customer, Project, Part Number, Contingency/Management Reserve Used, Expected Project End Date "
+            "and NOTES are maintained by hand in the 'Project Registry' tab of your Google Sheet. "
+            "Project Balance is computed live: sum of Budget Left for that row's Part Number(s)."
+        )
+
+        if not st.session_state.get("registry_connected"):
+            st.warning("PO $ registry isn't connected, so Open Projects can't be computed. See PO_REGISTRY_SETUP.md.")
         else:
-            st.dataframe(
-                open_projects,
-                use_container_width=True,
-                hide_index=True,
-                column_config={"Project Balance": st.column_config.NumberColumn(format="$%.2f")},
-            )
+            open_projects = build_open_projects(st.session_state.final_sheets)
+            if open_projects.empty:
+                st.info(
+                    "No rows yet in the 'Project Registry' tab. Add Customer / Project / Part Number rows "
+                    "there and they'll show up here with Project Balance filled in automatically."
+                )
+            else:
+                st.dataframe(
+                    open_projects,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={"Project Balance": st.column_config.NumberColumn(format="$%.2f")},
+                )
