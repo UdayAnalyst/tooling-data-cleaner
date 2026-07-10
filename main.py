@@ -226,6 +226,69 @@ def build_open_projects(final_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return registry_df[ordered_cols]
 
 
+HISTORY_HEADERS = ["Date", "Customer", "Project", "Part Number", "Project Balance"]
+HISTORY_KEY_COLS = ["Customer", "Project", "Part Number"]
+
+
+def get_history_worksheet():
+    import gspread
+
+    client = get_gsheet_client()
+    sheet = client.open_by_key(st.secrets["po_registry_sheet_id"])
+    try:
+        return sheet.worksheet("History")
+    except gspread.WorksheetNotFound:
+        worksheet = sheet.add_worksheet(title="History", rows=2000, cols=len(HISTORY_HEADERS))
+        worksheet.append_row(HISTORY_HEADERS)
+        return worksheet
+
+
+def load_history() -> pd.DataFrame:
+    """Returns every logged Project Balance snapshot, one row per Date x
+    Customer/Project/Part Number. Fetches UNFORMATTED_VALUE and coerces
+    Project Balance to numeric (dropping rows that fail) so a stray
+    currency-formatted or blank cell can't break the trend chart or, worse,
+    silently empty the whole history via save_history's overwrite — same
+    class of bug fixed in load_po_registry. Returns an empty frame if Google
+    Sheets isn't configured."""
+    try:
+        worksheet = get_history_worksheet()
+        records = worksheet.get_all_records(value_render_option="UNFORMATTED_VALUE")
+    except Exception:
+        return pd.DataFrame(columns=HISTORY_HEADERS)
+
+    if not records:
+        return pd.DataFrame(columns=HISTORY_HEADERS)
+    history = pd.DataFrame(records)
+    history["Project Balance"] = pd.to_numeric(history["Project Balance"], errors="coerce")
+    return history.dropna(subset=["Project Balance"])
+
+
+def log_open_projects_snapshot(open_projects: pd.DataFrame) -> bool:
+    """Appends today's Project Balance for each Open Projects row to the
+    History tab, so trends can be charted over time. Re-running Generate
+    Final Results on the same day replaces that day's rows instead of
+    duplicating them. Returns False (without raising) if Sheets isn't
+    configured or there's nothing to log."""
+    if open_projects.empty:
+        return False
+    try:
+        today = pd.Timestamp.now().strftime("%Y-%m-%d")
+        history = load_history()
+        history = history[history["Date"] != today]
+
+        new_rows = open_projects[HISTORY_KEY_COLS + ["Project Balance"]].copy()
+        new_rows.insert(0, "Date", today)
+
+        combined = pd.concat([history, new_rows], ignore_index=True)[HISTORY_HEADERS]
+        worksheet = get_history_worksheet()
+        worksheet.clear()
+        worksheet.update([HISTORY_HEADERS] + combined.values.tolist())
+        return True
+    except Exception:
+        return False
+
+
 st.set_page_config(page_title="Tooling Data Cleaning & Budget Tool", layout="wide")
 
 REQUIRED_COLUMNS = [
@@ -545,6 +608,10 @@ if st.button("Generate Final Results", type="primary"):
         else:
             st.warning("Couldn't save to the PO $ registry — values won't be remembered next time.")
 
+        open_projects = build_open_projects(final_sheets)
+        if log_open_projects_snapshot(open_projects):
+            st.toast("Logged today's Project Balance snapshot to History.", icon="📈")
+
 if "final_sheets" in st.session_state:
     tab_data, tab_report = st.tabs(["Data Cleaning", "Report"])
 
@@ -681,3 +748,47 @@ if "final_sheets" in st.session_state:
                     hide_index=True,
                     column_config={"Project Balance": st.column_config.NumberColumn(format="$%.2f")},
                 )
+
+        st.header("Step 6: Project Balance Trend")
+        st.caption(
+            "Tracks each Open Projects row's Project Balance over time. A snapshot is logged "
+            "automatically whenever 'Generate Final Results' is run, once per project per day."
+        )
+
+        if not st.session_state.get("registry_connected"):
+            st.warning("PO $ registry isn't connected, so there's no history to show. See PO_REGISTRY_SETUP.md.")
+        else:
+            history = load_history()
+            if history.empty or history["Date"].nunique() < 2:
+                st.info(
+                    "Not enough history yet to plot a trend — run 'Generate Final Results' again on a "
+                    "later day and a chart will appear here."
+                )
+            else:
+                history = history.assign(Label=history["Customer"] + " — " + history["Project"])
+                all_labels = sorted(history["Label"].unique())
+                selected = st.multiselect("Projects to show", all_labels, default=all_labels[:8])
+                filtered = history[history["Label"].isin(selected)] if selected else history
+
+                trend_chart = (
+                    alt.Chart(filtered)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("Date:T", title=None),
+                        y=alt.Y(
+                            "Project Balance:Q",
+                            title="Project Balance ($)",
+                            axis=alt.Axis(format="$,.0f"),
+                        ),
+                        color=alt.Color("Label:N", legend=alt.Legend(title=None)),
+                        tooltip=[
+                            "Date",
+                            "Customer",
+                            "Project",
+                            "Part Number",
+                            alt.Tooltip("Project Balance:Q", format="$,.2f"),
+                        ],
+                    )
+                    .properties(height=340)
+                )
+                st.altair_chart(trend_chart, use_container_width=True)
