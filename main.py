@@ -44,17 +44,30 @@ def get_po_registry_worksheet():
 def load_po_registry() -> dict[str, float]:
     """Returns {Okay PN: Total PO $} remembered from previous days. Returns an
     empty registry (rather than raising) if Google Sheets isn't configured, so
-    the app still works without it — see PO_REGISTRY_SETUP.md."""
+    the app still works without it — see PO_REGISTRY_SETUP.md. Fetches
+    UNFORMATTED_VALUE so currency-formatted cells (e.g. '$174,827.00', or
+    '$ -' for zero — both just display formatting on an underlying number)
+    come back as plain numbers instead of strings that fail float(). Rows
+    with a genuinely blank/non-numeric Total PO $ (e.g. a new Okay PN added
+    by hand and not yet filled in) are skipped individually rather than
+    blanking the whole registry, since this feeds save_po_registry's
+    full-sheet overwrite."""
     try:
         worksheet = get_po_registry_worksheet()
-        records = worksheet.get_all_records()
-        return {
-            normalize_pn(r["Okay PN"]): float(r["Total PO $"])
-            for r in records
-            if str(r.get("Okay PN", "")).strip() != ""
-        }
+        records = worksheet.get_all_records(value_render_option="UNFORMATTED_VALUE")
     except Exception:
         return {}
+
+    registry = {}
+    for r in records:
+        pn = str(r.get("Okay PN", "")).strip()
+        if not pn:
+            continue
+        try:
+            registry[normalize_pn(pn)] = float(r["Total PO $"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return registry
 
 
 def is_registry_configured() -> bool:
