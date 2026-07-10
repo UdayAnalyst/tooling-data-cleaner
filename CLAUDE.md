@@ -19,13 +19,15 @@ Run locally: `streamlit run main.py`
    pre-filled from the PO Registry by normalized `Okay PN` when connected.
 4. **Step 3 (Final Results)** — `Budget Left = Total PO $ - Total Cost`, plus a
    TOTAL row (`add_totals_row`); downloadable as Excel (`build_excel`).
-5. **Report tab (Steps 4-5)** — `build_project_summary` (one row per uploaded
+5. **Report tab (Steps 4-6)** — `build_project_summary` (one row per uploaded
    file, Profit/Loss vs. `Total PO $`), KPI metrics, an Altair chart, an Excel
-   export with a native colored bar chart (`build_project_summary_excel`), and
+   export with a native colored bar chart (`build_project_summary_excel`),
    **Open Projects** (`build_open_projects`) joining the hand-maintained Project
-   Registry with a live-computed Project Balance per Part Number prefix.
+   Registry with a live-computed Project Balance per Part Number prefix, and
+   **Step 6: Project Balance Trend** charting that same balance over time from
+   the History tab (see below).
 
-## Two Google Sheets-backed registries (both optional, app degrades gracefully)
+## Three Google Sheets-backed registries (all optional, app degrades gracefully)
 
 - **PO Registry** (`Okay PN` -> `Total PO $`) — remembers PO $ entries across
   days so they don't need re-entering. Read/write via `load_po_registry` /
@@ -35,9 +37,14 @@ Run locally: `streamlit run main.py`
   Number(s), contingency flag, expected end date, notes) in a "Project
   Registry" worksheet tab; `Project Balance` is *not* stored, it's computed live
   from `Budget Left` grouped by `Okay PN` prefix (`extract_pn_prefix`).
+- **History** — one row per (Date, Customer, Project, Part Number) snapshot of
+  Project Balance, logged automatically on "Generate Final Results" via
+  `log_open_projects_snapshot`. Re-running on the same day replaces that day's
+  rows rather than duplicating them. Feeds the Step 6 trend chart via
+  `load_history`.
 
-Both live in the same spreadsheet (`st.secrets["po_registry_sheet_id"]`), as
-separate worksheet tabs, auto-created on first use if missing.
+All three live in the same spreadsheet (`st.secrets["po_registry_sheet_id"]`),
+as separate worksheet tabs, auto-created on first use if missing.
 
 Setup instructions for the Sheets/Drive service account: `PO_REGISTRY_SETUP.md`.
 
@@ -67,3 +74,19 @@ raising, so the app works with zero config too.
   empty/false value rather than raising, so the UI never hard-crashes on a
   misconfigured or unreachable registry — follow this pattern for any new
   Sheets/Drive calls.
+- Gotcha (caused real data loss once, see git history around the
+  "PO registry data loss" fix): `worksheet.get_all_records()` defaults to
+  `FORMATTED_VALUE`, so a currency-formatted cell comes back as a string like
+  `'$174,827.00'` or `'$ -'` instead of a number. Always pass
+  `value_render_option="UNFORMATTED_VALUE"` when reading a numeric column, and
+  parse/validate rows individually (never one try/except around the whole
+  load) — any function that does a full-sheet `clear()` + rewrite (like
+  `save_po_registry`, `log_open_projects_snapshot`) will otherwise silently
+  wipe out everyone else's data the moment one row fails to parse.
+
+## Pending / not yet pushed
+
+- Commit `808c046` on `development` ("Add Project Balance history logging and
+  trend chart (Step 6)") is local-only — not yet pushed to
+  `origin/development` or merged into `main`. Revisit and push when ready;
+  don't assume the deployed app has this feature yet.
