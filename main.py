@@ -321,6 +321,16 @@ def extract_pn_prefix(value: str) -> str:
     return match.group(0) if match else value
 
 
+def derive_sheet_label(df: pd.DataFrame, fallback: str) -> str:
+    """Human-readable heading for a sheet, e.g. '932/4066', based on its Okay
+    PN prefixes — used instead of the raw uploaded filename, which is often an
+    auto-generated export name like 'Query_2026_07_10-09-12-16'. Falls back to
+    that filename if no prefixes can be derived (e.g. an empty sheet)."""
+    data_rows = df[df[df.columns[0]] != "TOTAL"]
+    prefixes = data_rows["Okay PN"].dropna().astype(str).map(extract_pn_prefix).unique()
+    return "/".join(prefixes) if len(prefixes) else fallback
+
+
 def build_project_summary(final_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """One row per uploaded file, reusing each file's existing TOTAL row from
     Step 3. If a file contains multiple unique Tooling Job No. (or Okay PN
@@ -503,14 +513,17 @@ else:
 
 edited_data = {}
 for sheet_name, df in st.session_state.editor_data.items():
-    st.subheader(sheet_name)
-    edited_data[sheet_name] = st.data_editor(
-        df,
-        key=f"editor_{sheet_name}_{st.session_state.registry_version}",
-        disabled=[c for c in df.columns if c != "Total PO $"],
-        use_container_width=True,
-        num_rows="fixed",
-    )
+    label = derive_sheet_label(df, sheet_name)
+    with st.expander(label, expanded=len(st.session_state.editor_data) == 1):
+        if label != sheet_name:
+            st.caption(f"Source file: {sheet_name}")
+        edited_data[sheet_name] = st.data_editor(
+            df,
+            key=f"editor_{sheet_name}_{st.session_state.registry_version}",
+            disabled=[c for c in df.columns if c != "Total PO $"],
+            use_container_width=True,
+            num_rows="fixed",
+        )
 
 if st.button("Generate Final Results", type="primary"):
     final_sheets = {}
@@ -538,7 +551,10 @@ if "final_sheets" in st.session_state:
     with tab_data:
         st.header("Step 3: Final Results")
         for sheet_name, df_final in st.session_state.final_sheets.items():
-            st.subheader(sheet_name)
+            label = derive_sheet_label(df_final, sheet_name)
+            st.subheader(label)
+            if label != sheet_name:
+                st.caption(f"Source file: {sheet_name}")
             st.dataframe(df_final, use_container_width=True)
 
         st.download_button(
