@@ -9,22 +9,19 @@ from openpyxl.chart.series import DataPoint
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from plex_data import (
+    fetch_plex_sheets,
+    get_gsheet_client,
+    is_odbc_configured,
+    is_registry_configured,
+    load_project_registry,
+    parse_part_numbers,
+)
+
 STATUS_COLORS = {"Profit": "#0ca30c", "Loss": "#d03b3b"}
 STATUS_COLORS_HEX = {"Profit": "0CA30C", "Loss": "D03B3B"}  # no '#', for openpyxl
 
 PO_REGISTRY_HEADERS = ["Okay PN", "Total PO $"]
-GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-
-@st.cache_resource
-def get_gsheet_client():
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=GSHEET_SCOPES
-    )
-    return gspread.authorize(creds)
 
 
 def get_po_registry_worksheet():
@@ -69,13 +66,6 @@ def load_po_registry() -> dict[str, float]:
     return registry
 
 
-def is_registry_configured() -> bool:
-    try:
-        return "gcp_service_account" in st.secrets
-    except Exception:
-        return False
-
-
 def save_po_registry(registry: dict[str, float]) -> bool:
     """Overwrites the registry sheet with the given {Okay PN: Total PO $} map.
     Returns False (without raising) if Google Sheets isn't configured."""
@@ -89,211 +79,64 @@ def save_po_registry(registry: dict[str, float]) -> bool:
         return False
 
 
-def is_odbc_configured() -> bool:
+GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+
+@st.cache_resource
+def get_drive_session():
+    """An authenticated HTTP session for the Google Drive API, reusing the same
+    service account as the PO/Project registries — just needs Drive scope added."""
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2.service_account import Credentials
+
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=GDRIVE_SCOPES
+    )
+    return AuthorizedSession(creds)
+
+
+def is_drive_configured() -> bool:
+    """True when a Drive folder is configured to read the daily Plex export
+    from (daily_plex_export.py writes there) — the fallback source used when
+    ODBC isn't available locally, e.g. on a Cloud deployment."""
     try:
-        return "odbc_dsn" in st.secrets
+        return "gcp_service_account" in st.secrets and "plex_export_folder_id" in st.secrets
     except Exception:
         return False
 
 
-def get_odbc_connection():
-    """A fresh pyodbc connection to Plex's cloud ODBC reporting service, via a
-    named Windows DSN (Data Source Administrator) that has the host, port, and
-    data source saved in it. The DataDirect OpenAccess SDK driver behind this
-    DSN does *not* persist the UID/PWD from the setup dialog, so both are
-    passed explicitly here — PWD carries the IAM access token
-    (authmethod=iam;accesstoken=...), UID the Plex employee/user ID. Opened
-    fresh per query rather than cached, since it's only used a handful of
-    times per run and a long-lived cached connection can go stale between
-    reruns."""
-    import pyodbc
-
-    conn_str = (
-        f"DSN={st.secrets['odbc_dsn']};"
-        f"UID={st.secrets['odbc_uid']};"
-        f"PWD={st.secrets['odbc_pwd']};"
+def list_drive_files() -> list[dict]:
+    """Lists CSV/Excel files in the configured Google Drive folder."""
+    session = get_drive_session()
+    folder_id = st.secrets["plex_export_folder_id"]
+    response = session.get(
+        "https://www.googleapis.com/drive/v3/files",
+        params={
+            "q": f"'{folder_id}' in parents and trashed = false",
+            "fields": "files(id, name)",
+        },
     )
-    return pyodbc.connect(conn_str)
+    response.raise_for_status()
+    files = response.json().get("files", [])
+    return [f for f in files if f["name"].lower().endswith((".csv", ".xlsx", ".xls"))]
 
 
-# Plex tooling job-cost query, adapted from the version provided for the
-# DataDirect OpenAccess SQL engine behind Plex's cloud ODBC service, which
-# doesn't support T-SQL scripting (DECLARE, OPTION hints) — only a single
-# SELECT. It also has a driver bug where a `?` bound parameter silently
-# matches zero rows once more than one JOIN is involved (confirmed against
-# the live service: identical literal SQL returns correct rows, the same
-# query with the Part No. filter as a bound parameter returns none). So
-# fetch_plex_job inlines the filter as an escaped, allowlist-validated
-# literal via {part_no_pattern} instead of a query parameter — the Job Group
-# / Job Key filters from the original query are dropped entirely since they
-# were always left at -1 (no-op) in practice.
-PLEX_JOB_QUERY_TEMPLATE = """
-SELECT
-    AJG.Accounting_Job_Group,
-    AJ.Accounting_Job_No,
-    P.Part_No + '-' + P.Revision            AS [Okay PN],
-    P.Name                                  AS [Tooling Line Item Description],
-    J.Job_No                                AS [Tooling Job No.],
-
-    ISNULL(SP.Price,0) *
-    ISNULL(SR.Quantity,0)                   AS [Total Revenue],
-    ISNULL(AR.Credit,0)                     AS [Invoiced Revenue],
-    ISNULL(PO_Cost.Cost,0)                  AS [Vendor POs Cost],
-    ISNULL(LC.Cost,0)                       AS [Labor Cost],
-    ISNULL(PO_Cost.Cost,0) +
-    ISNULL(LC.Cost,0)                       AS [Total Cost],
-    (ISNULL(SP.Price,0) *
-     ISNULL(SR.Quantity,0)) -
-    (ISNULL(PO_Cost.Cost,0) +
-     ISNULL(LC.Cost,0))                     AS [Profit or Loss]
-
-FROM Part_v_Part P
-JOIN Part_v_Part_Product_Type PT
-    ON PT.PCN = P.Plexus_Customer_No
-    AND PT.Product_Type_Key = P.Product_Type_Key
-LEFT OUTER JOIN Part_v_Job J
-    ON P.Plexus_Customer_No = J.PCN
-    AND P.Part_Key = J.Part_Key
-LEFT OUTER JOIN Accounting_v_Accounting_Job AJ
-    ON J.PCN = AJ.PCN
-    AND J.Accounting_Job_Key = AJ.Accounting_Job_Key
-LEFT OUTER JOIN Accounting_v_Accounting_Job_Group AJG
-    ON AJ.PCN = AJG.PCN
-    AND AJ.Accounting_Job_Group_Key = AJG.Accounting_Job_Group_Key
-LEFT OUTER JOIN Sales_v_PO_Line SPOL
-    ON P.Plexus_Customer_No = SPOL.PCN
-    AND P.Part_Key = SPOL.Part_Key
-LEFT OUTER JOIN Sales_v_Price SP
-    ON SPOL.PCN = SP.PCN
-    AND SPOL.PO_Line_Key = SP.PO_Line_Key
-LEFT OUTER JOIN (
-    SELECT SPOL2.PCN, SPOL2.PO_Line_Key,
-           SUM(SR2.Quantity) AS Quantity
-    FROM Sales_v_PO_Line SPOL2
-    JOIN Sales_v_Release SR2
-        ON SPOL2.PCN = SR2.PCN
-        AND SPOL2.PO_Line_Key = SR2.PO_Line_Key
-    GROUP BY SPOL2.PCN, SPOL2.PO_Line_Key
-) AS SR
-    ON SPOL.PCN = SR.PCN
-    AND SPOL.PO_Line_Key = SR.PO_Line_Key
-LEFT OUTER JOIN (
-    SELECT ARID.Plexus_Customer_No, ARID.Part_Key,
-           SUM(ARID.Credit) AS Credit
-    FROM Accounting_v_AR_Invoice_Dist ARID
-    GROUP BY ARID.Plexus_Customer_No, ARID.Part_Key
-) AS AR
-    ON P.Plexus_Customer_No = AR.Plexus_Customer_No
-    AND P.Part_Key = AR.Part_Key
-LEFT OUTER JOIN (
-    SELECT POL.Plexus_Customer_No, POL.For_Part_Key,
-           SUM(POL.Unit_Price * POR2.Quantity) AS Cost
-    FROM Purchasing_v_Line_Item POL
-    LEFT OUTER JOIN Purchasing_v_Release POR2
-        ON POL.Plexus_Customer_No = POR2.Plexus_Customer_No
-        AND POL.Line_Item_Key = POR2.Line_Item_Key
-    GROUP BY POL.Plexus_Customer_No, POL.For_Part_Key
-) AS PO_Cost
-    ON P.Plexus_Customer_No = PO_Cost.Plexus_Customer_No
-    AND P.Part_Key = PO_Cost.For_Part_Key
-LEFT OUTER JOIN (
-    SELECT C.PCN, C.Part_Key,
-           SUM(ROUND(C.Extended_Cost,2)) AS Cost
-    FROM Common_v_Cost C
-    WHERE C.Cost_Sub_Type_Key = 17924
-    GROUP BY C.PCN, C.Part_Key
-) AS LC
-    ON P.Plexus_Customer_No = LC.PCN
-    AND P.Part_Key = LC.Part_Key
-
-WHERE PT.Product_Type IN (
-    'Tooling','Inspection Device','NRE/Tooling',
-    'Packaging','In-Development','Production',
-    'Protype','Service'
-)
-AND P.Part_No LIKE '{part_no_pattern}'
-
-ORDER BY
-    AJG.Accounting_Job_Group,
-    AJ.Accounting_Job_No,
-    P.Part_No + '-' + P.Revision
-"""
-
-# Allowlist for Part No. filters — since the driver bug above rules out real
-# parameter binding, this is the injection defense for the literal
-# substitution into PLEX_JOB_QUERY_TEMPLATE instead. Matches the character
-# set actually seen in Plex Part Nos (letters, digits, spaces, -_.).
-PART_NO_FILTER_RE = re.compile(r"^[A-Za-z0-9 _.-]+$")
-
-
-def fetch_plex_job(part_no_filter: str) -> pd.DataFrame:
-    """Runs the Plex tooling job-cost query for a single Part No. filter (e.g.
-    '924'), returning one DataFrame — the ODBC equivalent of one Drive file."""
-    if not PART_NO_FILTER_RE.match(part_no_filter):
-        raise ValueError(f"Invalid Part No. filter: {part_no_filter!r}")
-    pattern = part_no_filter.replace("'", "''") + "%"
-    query = PLEX_JOB_QUERY_TEMPLATE.format(part_no_pattern=pattern)
-    conn = get_odbc_connection()
-    try:
-        return pd.read_sql(query, conn)
-    finally:
-        conn.close()
-
-
-def fetch_plex_sheets(part_filters: list[str]) -> dict[str, pd.DataFrame]:
-    """Runs the Plex query once per Part No. filter, returning {filter: DataFrame}
-    — each entry plugs straight into the same cleaning/PO/final-results
-    pipeline that a parsed upload sheet would."""
-    return {part_no: fetch_plex_job(part_no) for part_no in part_filters}
-
-
-PROJECT_REGISTRY_HEADERS = [
-    "Customer",
-    "Project",
-    "Part Number",
-    "Contingency/Management Reserve Used",
-    "Expected Project End Date",
-    "NOTES",
-]
-
-
-def get_project_registry_worksheet():
-    import gspread
-
-    client = get_gsheet_client()
-    sheet = client.open_by_key(st.secrets["po_registry_sheet_id"])
-    try:
-        return sheet.worksheet("Project Registry")
-    except gspread.WorksheetNotFound:
-        worksheet = sheet.add_worksheet(
-            title="Project Registry", rows=200, cols=len(PROJECT_REGISTRY_HEADERS)
+def fetch_drive_files() -> list[io.BytesIO]:
+    """Downloads every CSV/Excel file in the configured Google Drive folder —
+    populated daily by daily_plex_export.py — returning file-like objects with
+    a `.name` attribute, a drop-in replacement for Streamlit's uploaded-file
+    objects, compatible with load_all_sheets()."""
+    session = get_drive_session()
+    buffers = []
+    for item in list_drive_files():
+        response = session.get(
+            f"https://www.googleapis.com/drive/v3/files/{item['id']}", params={"alt": "media"}
         )
-        worksheet.append_row(PROJECT_REGISTRY_HEADERS)
-        return worksheet
-
-
-def load_project_registry() -> pd.DataFrame:
-    """Reads the hand-maintained Customer/Project/Part Number/Contingency/
-    Expected End Date/NOTES rows. Project Balance is computed separately, not
-    stored here. Returns an empty frame if Google Sheets isn't configured."""
-    try:
-        worksheet = get_project_registry_worksheet()
-        records = worksheet.get_all_records()
-        if not records:
-            return pd.DataFrame(columns=PROJECT_REGISTRY_HEADERS)
-        return pd.DataFrame(records)
-    except Exception:
-        return pd.DataFrame(columns=PROJECT_REGISTRY_HEADERS)
-
-
-def parse_part_numbers(value) -> list[str]:
-    """'931, 932, 985, 988' -> ['931', '932', '985', '988'], de-duplicated."""
-    parts = re.split(r"[,\s]+", str(value).strip())
-    seen = []
-    for part in parts:
-        if part and part not in seen:
-            seen.append(part)
-    return seen
+        response.raise_for_status()
+        buffer = io.BytesIO(response.content)
+        buffer.name = item["name"]
+        buffers.append(buffer)
+    return buffers
 
 
 def build_prefix_balances(final_sheets: dict[str, pd.DataFrame]) -> dict[str, float]:
@@ -623,6 +466,27 @@ if is_odbc_configured():
         st.info("Enter one or more Part No. filters above and click 'Fetch from Plex' to get started.")
         st.stop()
     sheet_key = list(raw_sheets.keys())
+elif is_drive_configured():
+    header_col, button_col = st.columns([4, 1])
+    with header_col:
+        st.caption("Files are fetched automatically from today's Plex export folder in Google Drive.")
+    with button_col:
+        if st.button("Refresh from Drive"):
+            st.session_state.pop("drive_files", None)
+
+    if "drive_files" not in st.session_state:
+        with st.spinner("Fetching files from Google Drive..."):
+            try:
+                st.session_state.drive_files = fetch_drive_files()
+            except Exception as e:
+                st.error(f"Couldn't fetch files from Google Drive: {e}")
+                st.session_state.drive_files = []
+
+    uploaded_files = st.session_state.drive_files
+    if not uploaded_files:
+        st.info("No CSV/Excel files found in the configured Google Drive folder.")
+        st.stop()
+    sheet_key = [f.name for f in uploaded_files]
 else:
     uploaded_files = st.file_uploader(
         "Upload CSV or Excel file(s)", type=["csv", "xlsx", "xls"], accept_multiple_files=True
