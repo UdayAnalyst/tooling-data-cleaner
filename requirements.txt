@@ -5,3 +5,4 @@ altair
 gspread
 google-auth
 requests
+pyodbc

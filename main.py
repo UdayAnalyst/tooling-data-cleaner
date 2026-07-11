@@ -9,23 +9,19 @@ from openpyxl.chart.series import DataPoint
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from plex_data import (
+    fetch_plex_sheets,
+    get_gsheet_client,
+    is_odbc_configured,
+    is_registry_configured,
+    load_project_registry,
+    parse_part_numbers,
+)
+
 STATUS_COLORS = {"Profit": "#0ca30c", "Loss": "#d03b3b"}
 STATUS_COLORS_HEX = {"Profit": "0CA30C", "Loss": "D03B3B"}  # no '#', for openpyxl
 
 PO_REGISTRY_HEADERS = ["Okay PN", "Total PO $"]
-GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-
-
-@st.cache_resource
-def get_gsheet_client():
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=GSHEET_SCOPES
-    )
-    return gspread.authorize(creds)
 
 
 def get_po_registry_worksheet():
@@ -70,13 +66,6 @@ def load_po_registry() -> dict[str, float]:
     return registry
 
 
-def is_registry_configured() -> bool:
-    try:
-        return "gcp_service_account" in st.secrets
-    except Exception:
-        return False
-
-
 def save_po_registry(registry: dict[str, float]) -> bool:
     """Overwrites the registry sheet with the given {Okay PN: Total PO $} map.
     Returns False (without raising) if Google Sheets isn't configured."""
@@ -88,6 +77,9 @@ def save_po_registry(registry: dict[str, float]) -> bool:
         return True
     except Exception:
         return False
+
+
+GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 
 @st.cache_resource
@@ -104,8 +96,11 @@ def get_drive_session():
 
 
 def is_drive_configured() -> bool:
+    """True when a Drive folder is configured to read the daily Plex export
+    from (daily_plex_export.py writes there) — the fallback source used when
+    ODBC isn't available locally, e.g. on a Cloud deployment."""
     try:
-        return "gcp_service_account" in st.secrets and "gdrive_folder_id" in st.secrets
+        return "gcp_service_account" in st.secrets and "plex_export_folder_id" in st.secrets
     except Exception:
         return False
 
@@ -113,7 +108,7 @@ def is_drive_configured() -> bool:
 def list_drive_files() -> list[dict]:
     """Lists CSV/Excel files in the configured Google Drive folder."""
     session = get_drive_session()
-    folder_id = st.secrets["gdrive_folder_id"]
+    folder_id = st.secrets["plex_export_folder_id"]
     response = session.get(
         "https://www.googleapis.com/drive/v3/files",
         params={
@@ -127,9 +122,10 @@ def list_drive_files() -> list[dict]:
 
 
 def fetch_drive_files() -> list[io.BytesIO]:
-    """Downloads every CSV/Excel file in the configured Google Drive folder, returning
-    file-like objects with a `.name` attribute — a drop-in replacement for
-    Streamlit's uploaded-file objects, compatible with load_all_sheets()."""
+    """Downloads every CSV/Excel file in the configured Google Drive folder —
+    populated daily by daily_plex_export.py — returning file-like objects with
+    a `.name` attribute, a drop-in replacement for Streamlit's uploaded-file
+    objects, compatible with load_all_sheets()."""
     session = get_drive_session()
     buffers = []
     for item in list_drive_files():
@@ -141,55 +137,6 @@ def fetch_drive_files() -> list[io.BytesIO]:
         buffer.name = item["name"]
         buffers.append(buffer)
     return buffers
-
-
-PROJECT_REGISTRY_HEADERS = [
-    "Customer",
-    "Project",
-    "Part Number",
-    "Contingency/Management Reserve Used",
-    "Expected Project End Date",
-    "NOTES",
-]
-
-
-def get_project_registry_worksheet():
-    import gspread
-
-    client = get_gsheet_client()
-    sheet = client.open_by_key(st.secrets["po_registry_sheet_id"])
-    try:
-        return sheet.worksheet("Project Registry")
-    except gspread.WorksheetNotFound:
-        worksheet = sheet.add_worksheet(
-            title="Project Registry", rows=200, cols=len(PROJECT_REGISTRY_HEADERS)
-        )
-        worksheet.append_row(PROJECT_REGISTRY_HEADERS)
-        return worksheet
-
-
-def load_project_registry() -> pd.DataFrame:
-    """Reads the hand-maintained Customer/Project/Part Number/Contingency/
-    Expected End Date/NOTES rows. Project Balance is computed separately, not
-    stored here. Returns an empty frame if Google Sheets isn't configured."""
-    try:
-        worksheet = get_project_registry_worksheet()
-        records = worksheet.get_all_records()
-        if not records:
-            return pd.DataFrame(columns=PROJECT_REGISTRY_HEADERS)
-        return pd.DataFrame(records)
-    except Exception:
-        return pd.DataFrame(columns=PROJECT_REGISTRY_HEADERS)
-
-
-def parse_part_numbers(value) -> list[str]:
-    """'931, 932, 985, 988' -> ['931', '932', '985', '988'], de-duplicated."""
-    parts = re.split(r"[,\s]+", str(value).strip())
-    seen = []
-    for part in parts:
-        if part and part not in seen:
-            seen.append(part)
-    return seen
 
 
 def build_prefix_balances(final_sheets: dict[str, pd.DataFrame]) -> dict[str, float]:
@@ -224,6 +171,69 @@ def build_open_projects(final_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
         "NOTES",
     ]
     return registry_df[ordered_cols]
+
+
+HISTORY_HEADERS = ["Date", "Customer", "Project", "Part Number", "Project Balance"]
+HISTORY_KEY_COLS = ["Customer", "Project", "Part Number"]
+
+
+def get_history_worksheet():
+    import gspread
+
+    client = get_gsheet_client()
+    sheet = client.open_by_key(st.secrets["po_registry_sheet_id"])
+    try:
+        return sheet.worksheet("History")
+    except gspread.WorksheetNotFound:
+        worksheet = sheet.add_worksheet(title="History", rows=2000, cols=len(HISTORY_HEADERS))
+        worksheet.append_row(HISTORY_HEADERS)
+        return worksheet
+
+
+def load_history() -> pd.DataFrame:
+    """Returns every logged Project Balance snapshot, one row per Date x
+    Customer/Project/Part Number. Fetches UNFORMATTED_VALUE and coerces
+    Project Balance to numeric (dropping rows that fail) so a stray
+    currency-formatted or blank cell can't break the trend chart or, worse,
+    silently empty the whole history via save_history's overwrite — same
+    class of bug fixed in load_po_registry. Returns an empty frame if Google
+    Sheets isn't configured."""
+    try:
+        worksheet = get_history_worksheet()
+        records = worksheet.get_all_records(value_render_option="UNFORMATTED_VALUE")
+    except Exception:
+        return pd.DataFrame(columns=HISTORY_HEADERS)
+
+    if not records:
+        return pd.DataFrame(columns=HISTORY_HEADERS)
+    history = pd.DataFrame(records)
+    history["Project Balance"] = pd.to_numeric(history["Project Balance"], errors="coerce")
+    return history.dropna(subset=["Project Balance"])
+
+
+def log_open_projects_snapshot(open_projects: pd.DataFrame) -> bool:
+    """Appends today's Project Balance for each Open Projects row to the
+    History tab, so trends can be charted over time. Re-running Generate
+    Final Results on the same day replaces that day's rows instead of
+    duplicating them. Returns False (without raising) if Sheets isn't
+    configured or there's nothing to log."""
+    if open_projects.empty:
+        return False
+    try:
+        today = pd.Timestamp.now().strftime("%Y-%m-%d")
+        history = load_history()
+        history = history[history["Date"] != today]
+
+        new_rows = open_projects[HISTORY_KEY_COLS + ["Project Balance"]].copy()
+        new_rows.insert(0, "Date", today)
+
+        combined = pd.concat([history, new_rows], ignore_index=True)[HISTORY_HEADERS]
+        worksheet = get_history_worksheet()
+        worksheet.clear()
+        worksheet.update([HISTORY_HEADERS] + combined.values.tolist())
+        return True
+    except Exception:
+        return False
 
 
 st.set_page_config(page_title="Tooling Data Cleaning & Budget Tool", layout="wide")
@@ -422,14 +432,47 @@ def build_project_summary_excel(project_summary: pd.DataFrame) -> bytes:
 
 st.title("Tooling Data Cleaning & Budget Tool")
 
-if is_drive_configured():
+raw_sheets = None  # only (re)computed inside the change-gate below
+
+if is_odbc_configured():
+    st.caption(
+        "Data is queried directly from Plex. Enter one Part No. filter per row "
+        "below (e.g. 924) — add rows with the + at the bottom, or paste a whole "
+        "column of them straight from Excel — then click 'Fetch from Plex'."
+    )
+
+    part_filters_df = st.data_editor(
+        pd.DataFrame({"Part No. Filter": [""]}),
+        key="part_filters_editor",
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+    )
+    fetch_clicked = st.button("Fetch from Plex")
+
+    if fetch_clicked:
+        part_filters = [
+            str(v).strip() for v in part_filters_df["Part No. Filter"] if str(v).strip()
+        ]
+        if part_filters:
+            with st.spinner(f"Querying Plex for {len(part_filters)} Part No. filter(s)..."):
+                try:
+                    st.session_state.plex_sheets = fetch_plex_sheets(part_filters)
+                except Exception as e:
+                    st.error(f"Couldn't query Plex: {e}")
+
+    raw_sheets = st.session_state.get("plex_sheets", {})
+    if not raw_sheets:
+        st.info("Enter one or more Part No. filters above and click 'Fetch from Plex' to get started.")
+        st.stop()
+    sheet_key = list(raw_sheets.keys())
+elif is_drive_configured():
     header_col, button_col = st.columns([4, 1])
     with header_col:
-        st.caption("Files are fetched automatically from the configured Google Drive folder.")
+        st.caption("Files are fetched automatically from today's Plex export folder in Google Drive.")
     with button_col:
         if st.button("Refresh from Drive"):
             st.session_state.pop("drive_files", None)
-            st.session_state.pop("uploaded_names", None)
 
     if "drive_files" not in st.session_state:
         with st.spinner("Fetching files from Google Drive..."):
@@ -443,17 +486,19 @@ if is_drive_configured():
     if not uploaded_files:
         st.info("No CSV/Excel files found in the configured Google Drive folder.")
         st.stop()
+    sheet_key = [f.name for f in uploaded_files]
 else:
     uploaded_files = st.file_uploader(
         "Upload CSV or Excel file(s)", type=["csv", "xlsx", "xls"], accept_multiple_files=True
     )
     if not uploaded_files:
-        st.info("Upload a file to get started, or see GDRIVE_SETUP.md to fetch automatically instead.")
+        st.info("Upload a file to get started, or see PO_REGISTRY_SETUP.md to connect ODBC instead.")
         st.stop()
+    sheet_key = [f.name for f in uploaded_files]
 
-uploaded_names = [f.name for f in uploaded_files]
-if st.session_state.get("uploaded_names") != uploaded_names:
-    raw_sheets = load_all_sheets(uploaded_files)
+if st.session_state.get("loaded_sheet_key") != sheet_key:
+    if raw_sheets is None:
+        raw_sheets = load_all_sheets(uploaded_files)
     processed, missing_report = {}, {}
 
     for sheet_name, df in raw_sheets.items():
@@ -466,7 +511,7 @@ if st.session_state.get("uploaded_names") != uploaded_names:
     po_registry = load_po_registry()
     st.session_state.registry_connected = is_registry_configured()
 
-    st.session_state.uploaded_names = uploaded_names
+    st.session_state.loaded_sheet_key = sheet_key
     st.session_state.missing_report = missing_report
     st.session_state.editor_data = {
         name: df.assign(
@@ -544,6 +589,10 @@ if st.button("Generate Final Results", type="primary"):
             st.toast(f"Saved {len(registry)} PO $ value(s) to the registry for next time.", icon="✅")
         else:
             st.warning("Couldn't save to the PO $ registry — values won't be remembered next time.")
+
+        open_projects = build_open_projects(final_sheets)
+        if log_open_projects_snapshot(open_projects):
+            st.toast("Logged today's Project Balance snapshot to History.", icon="📈")
 
 if "final_sheets" in st.session_state:
     tab_data, tab_report = st.tabs(["Data Cleaning", "Report"])
@@ -659,25 +708,29 @@ if "final_sheets" in st.session_state:
         st.altair_chart(chart, use_container_width=True)
 
         st.header("Step 5: Open Projects")
-        st.caption(
-            "Customer, Project, Part Number, Contingency/Management Reserve Used, Expected Project End Date "
-            "and NOTES are maintained by hand in the 'Project Registry' tab of your Google Sheet. "
-            "Project Balance is computed live: sum of Budget Left for that row's Part Number(s)."
-        )
-
-        if not st.session_state.get("registry_connected"):
-            st.warning("PO $ registry isn't connected, so Open Projects can't be computed. See PO_REGISTRY_SETUP.md.")
+        open_projects_code = st.text_input("Enter code to view Open Projects", type="password")
+        if open_projects_code != st.secrets.get("open_projects_code", "4045"):
+            st.info("Enter the access code above to view Open Projects.")
         else:
-            open_projects = build_open_projects(st.session_state.final_sheets)
-            if open_projects.empty:
-                st.info(
-                    "No rows yet in the 'Project Registry' tab. Add Customer / Project / Part Number rows "
-                    "there and they'll show up here with Project Balance filled in automatically."
-                )
+            st.caption(
+                "Customer, Project, Part Number, Contingency/Management Reserve Used, Expected Project End Date "
+                "and NOTES are maintained by hand in the 'Project Registry' tab of your Google Sheet. "
+                "Project Balance is computed live: sum of Budget Left for that row's Part Number(s)."
+            )
+
+            if not st.session_state.get("registry_connected"):
+                st.warning("PO $ registry isn't connected, so Open Projects can't be computed. See PO_REGISTRY_SETUP.md.")
             else:
-                st.dataframe(
-                    open_projects,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={"Project Balance": st.column_config.NumberColumn(format="$%.2f")},
-                )
+                open_projects = build_open_projects(st.session_state.final_sheets)
+                if open_projects.empty:
+                    st.info(
+                        "No rows yet in the 'Project Registry' tab. Add Customer / Project / Part Number rows "
+                        "there and they'll show up here with Project Balance filled in automatically."
+                    )
+                else:
+                    st.dataframe(
+                        open_projects,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={"Project Balance": st.column_config.NumberColumn(format="$%.2f")},
+                    )
