@@ -13,15 +13,19 @@ import streamlit as st
 GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
+def get_credentials(scopes: list[str]):
+    """Service-account credentials for the given OAuth scopes, built from the
+    same gcp_service_account secret used by every Sheets/Drive caller."""
+    from google.oauth2.service_account import Credentials
+
+    return Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+
+
 @st.cache_resource
 def get_gsheet_client():
     import gspread
-    from google.oauth2.service_account import Credentials
 
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=GSHEET_SCOPES
-    )
-    return gspread.authorize(creds)
+    return gspread.authorize(get_credentials(GSHEET_SCOPES))
 
 
 def is_registry_configured() -> bool:
@@ -29,6 +33,22 @@ def is_registry_configured() -> bool:
         return "gcp_service_account" in st.secrets
     except Exception:
         return False
+
+
+def get_or_create_worksheet(title: str, headers: list[str], rows: int = 200):
+    """Returns the named worksheet tab in the shared registry spreadsheet
+    (st.secrets["po_registry_sheet_id"]), creating it with a header row if it
+    doesn't exist yet."""
+    import gspread
+
+    client = get_gsheet_client()
+    sheet = client.open_by_key(st.secrets["po_registry_sheet_id"])
+    try:
+        return sheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        worksheet = sheet.add_worksheet(title=title, rows=rows, cols=len(headers))
+        worksheet.append_row(headers)
+        return worksheet
 
 
 PROJECT_REGISTRY_HEADERS = [
@@ -42,18 +62,7 @@ PROJECT_REGISTRY_HEADERS = [
 
 
 def get_project_registry_worksheet():
-    import gspread
-
-    client = get_gsheet_client()
-    sheet = client.open_by_key(st.secrets["po_registry_sheet_id"])
-    try:
-        return sheet.worksheet("Project Registry")
-    except gspread.WorksheetNotFound:
-        worksheet = sheet.add_worksheet(
-            title="Project Registry", rows=200, cols=len(PROJECT_REGISTRY_HEADERS)
-        )
-        worksheet.append_row(PROJECT_REGISTRY_HEADERS)
-        return worksheet
+    return get_or_create_worksheet("Project Registry", PROJECT_REGISTRY_HEADERS, rows=200)
 
 
 def load_project_registry() -> pd.DataFrame:
