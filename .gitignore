@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 venv/
 .streamlit/secrets.toml
+CLAUDE.md
