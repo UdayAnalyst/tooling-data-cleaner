@@ -11,7 +11,8 @@ from openpyxl.utils import get_column_letter
 
 from plex_data import (
     fetch_plex_sheets,
-    get_gsheet_client,
+    get_credentials,
+    get_or_create_worksheet,
     is_odbc_configured,
     is_registry_configured,
     load_project_registry,
@@ -25,16 +26,7 @@ PO_REGISTRY_HEADERS = ["Okay PN", "Total PO $"]
 
 
 def get_po_registry_worksheet():
-    import gspread
-
-    client = get_gsheet_client()
-    sheet = client.open_by_key(st.secrets["po_registry_sheet_id"])
-    try:
-        return sheet.worksheet("PO Registry")
-    except gspread.WorksheetNotFound:
-        worksheet = sheet.add_worksheet(title="PO Registry", rows=1000, cols=2)
-        worksheet.append_row(PO_REGISTRY_HEADERS)
-        return worksheet
+    return get_or_create_worksheet("PO Registry", PO_REGISTRY_HEADERS, rows=1000)
 
 
 def load_po_registry() -> dict[str, float]:
@@ -87,12 +79,8 @@ def get_drive_session():
     """An authenticated HTTP session for the Google Drive API, reusing the same
     service account as the PO/Project registries — just needs Drive scope added."""
     from google.auth.transport.requests import AuthorizedSession
-    from google.oauth2.service_account import Credentials
 
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=GDRIVE_SCOPES
-    )
-    return AuthorizedSession(creds)
+    return AuthorizedSession(get_credentials(GDRIVE_SCOPES))
 
 
 def is_drive_configured() -> bool:
@@ -105,8 +93,11 @@ def is_drive_configured() -> bool:
         return False
 
 
-def list_drive_files() -> list[dict]:
-    """Lists CSV/Excel files in the configured Google Drive folder."""
+def fetch_drive_files() -> list[io.BytesIO]:
+    """Downloads every CSV/Excel file in the configured Google Drive folder —
+    populated daily by daily_plex_export.py — returning file-like objects with
+    a `.name` attribute, a drop-in replacement for Streamlit's uploaded-file
+    objects, compatible with load_all_sheets()."""
     session = get_drive_session()
     folder_id = st.secrets["plex_export_folder_id"]
     response = session.get(
@@ -118,17 +109,11 @@ def list_drive_files() -> list[dict]:
     )
     response.raise_for_status()
     files = response.json().get("files", [])
-    return [f for f in files if f["name"].lower().endswith((".csv", ".xlsx", ".xls"))]
 
-
-def fetch_drive_files() -> list[io.BytesIO]:
-    """Downloads every CSV/Excel file in the configured Google Drive folder —
-    populated daily by daily_plex_export.py — returning file-like objects with
-    a `.name` attribute, a drop-in replacement for Streamlit's uploaded-file
-    objects, compatible with load_all_sheets()."""
-    session = get_drive_session()
     buffers = []
-    for item in list_drive_files():
+    for item in files:
+        if not item["name"].lower().endswith((".csv", ".xlsx", ".xls")):
+            continue
         response = session.get(
             f"https://www.googleapis.com/drive/v3/files/{item['id']}", params={"alt": "media"}
         )
@@ -178,16 +163,7 @@ HISTORY_KEY_COLS = ["Customer", "Project", "Part Number"]
 
 
 def get_history_worksheet():
-    import gspread
-
-    client = get_gsheet_client()
-    sheet = client.open_by_key(st.secrets["po_registry_sheet_id"])
-    try:
-        return sheet.worksheet("History")
-    except gspread.WorksheetNotFound:
-        worksheet = sheet.add_worksheet(title="History", rows=2000, cols=len(HISTORY_HEADERS))
-        worksheet.append_row(HISTORY_HEADERS)
-        return worksheet
+    return get_or_create_worksheet("History", HISTORY_HEADERS, rows=2000)
 
 
 def load_history() -> pd.DataFrame:
@@ -417,9 +393,7 @@ def build_project_summary_excel(project_summary: pd.DataFrame) -> bytes:
         chart.set_categories(cats)
 
         series = chart.series[0]
-        series.data_points = [
-            DataPoint(idx=i, spPr=None) for i in range(n_rows)
-        ]
+        series.data_points = [DataPoint(idx=i) for i in range(n_rows)]
         for i, status in enumerate(project_summary["Status"]):
             point = series.data_points[i]
             point.graphicalProperties.solidFill = STATUS_COLORS_HEX[status]
