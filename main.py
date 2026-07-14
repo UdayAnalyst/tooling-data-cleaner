@@ -38,8 +38,7 @@ def load_po_registry() -> dict[str, float]:
     come back as plain numbers instead of strings that fail float(). Rows
     with a genuinely blank/non-numeric Total PO $ (e.g. a new Okay PN added
     by hand and not yet filled in) are skipped individually rather than
-    blanking the whole registry, since this feeds save_po_registry's
-    full-sheet overwrite."""
+    blanking the whole registry."""
     try:
         worksheet = get_po_registry_worksheet()
         records = worksheet.get_all_records(value_render_option="UNFORMATTED_VALUE")
@@ -56,19 +55,6 @@ def load_po_registry() -> dict[str, float]:
         except (KeyError, TypeError, ValueError):
             continue
     return registry
-
-
-def save_po_registry(registry: dict[str, float]) -> bool:
-    """Overwrites the registry sheet with the given {Okay PN: Total PO $} map.
-    Returns False (without raising) if Google Sheets isn't configured."""
-    try:
-        worksheet = get_po_registry_worksheet()
-        worksheet.clear()
-        rows = [PO_REGISTRY_HEADERS] + [[k, v] for k, v in registry.items()]
-        worksheet.update(rows)
-        return True
-    except Exception:
-        return False
 
 
 GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
@@ -246,6 +232,16 @@ def normalize_pn(value) -> str:
     one, e.g. '932 A PD-01-' vs '932 A PD-01'), and ignores case."""
     text = re.sub(r"\s+", " ", str(value).strip().upper())
     return text.rstrip("- ")
+
+
+def is_junk_okay_pn(value) -> bool:
+    """True for an Okay PN that's just a bare number/revision code with no
+    real description — e.g. '931-01', '924-1 -01', or a number plus a
+    standalone 'ASY' suffix like '938 ASY-01'. These rows get dropped during
+    cleaning. A PN with real text after ASY (e.g. '4243 ASY A MC-01-01') is
+    kept — only the first, whole-word 'ASY' is stripped before checking."""
+    text = re.sub(r"(?<![A-Z])ASY(?![A-Z])", "", str(value).strip().upper(), count=1)
+    return bool(re.fullmatch(r"[\d\s\-]*", text))
 
 
 def consolidate_duplicates(df: pd.DataFrame) -> pd.DataFrame:
@@ -480,6 +476,7 @@ if st.session_state.get("loaded_sheet_key") != sheet_key:
         if missing:
             missing_report[sheet_name] = missing
             continue
+        df = df[~df["Okay PN"].apply(is_junk_okay_pn)]
         processed[sheet_name] = consolidate_duplicates(df)
 
     po_registry = load_po_registry()
@@ -506,7 +503,7 @@ st.session_state.setdefault("registry_version", 0)
 
 step2_header, step2_button = st.columns([4, 1])
 with step2_header:
-    st.header("Step 2: Enter Total PO $ for each row")
+    st.header("Step 2: Total PO $ for each row")
 if st.session_state.get("registry_connected"):
     with step2_button:
         if st.button("Refresh from registry"):
@@ -518,13 +515,12 @@ if st.session_state.get("registry_connected"):
             st.session_state.registry_version += 1
             st.rerun()
     st.caption(
-        "Only the 'Total PO $' column is editable. Values already seen for an Okay PN are "
-        "pre-filled from your saved registry — just correct the ones that changed. If you edited "
-        "the registry in Google Sheets after uploading, click 'Refresh from registry' to pull the "
-        "latest values in without needing to re-upload."
+        "'Total PO $' is locked here — it's pulled from your saved registry and can't be edited from "
+        "this website. Update values in the 'PO Registry' tab of your Google Sheet, then click "
+        "'Refresh from registry' to pull the latest values in without needing to re-upload."
     )
 else:
-    st.caption("Only the 'Total PO $' column is editable — all other columns are shown read-only for context.")
+    st.caption("'Total PO $' is locked and shown read-only — it can only be set via the Google Sheet registry.")
     st.warning(
         "PO $ registry isn't connected yet, so values aren't being remembered day to day. "
         "See PO_REGISTRY_SETUP.md to enable it."
@@ -539,7 +535,7 @@ for sheet_name, df in st.session_state.editor_data.items():
         edited_data[sheet_name] = st.data_editor(
             df,
             key=f"editor_{sheet_name}_{st.session_state.registry_version}",
-            disabled=[c for c in df.columns if c != "Total PO $"],
+            disabled=True,
             use_container_width=True,
             num_rows="fixed",
         )
@@ -553,17 +549,6 @@ if st.button("Generate Final Results", type="primary"):
     st.session_state.final_sheets = final_sheets
 
     if st.session_state.get("registry_connected"):
-        registry = load_po_registry()
-        for sheet_name, df in edited_data.items():
-            baseline = st.session_state.editor_data[sheet_name]
-            changed = df[df["Total PO $"] != baseline["Total PO $"]]
-            updates = dict(zip(changed["Okay PN"].map(normalize_pn), changed["Total PO $"]))
-            registry.update(updates)
-        if save_po_registry(registry):
-            st.toast(f"Saved {len(registry)} PO $ value(s) to the registry for next time.", icon="✅")
-        else:
-            st.warning("Couldn't save to the PO $ registry — values won't be remembered next time.")
-
         open_projects = build_open_projects(final_sheets)
         if log_open_projects_snapshot(open_projects):
             st.toast("Logged today's Project Balance snapshot to History.", icon="📈")
