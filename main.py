@@ -402,6 +402,10 @@ def build_project_summary_excel(project_summary: pd.DataFrame) -> bytes:
 
 st.title("Tooling Data Cleaning & Budget Tool")
 
+if st.text_input("Enter access code to continue", type="password") != st.secrets.get("site_access_code"):
+    st.info("Enter the access code above to continue.")
+    st.stop()
+
 raw_sheets = None  # only (re)computed inside the change-gate below
 
 if is_odbc_configured():
