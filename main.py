@@ -244,6 +244,9 @@ def is_junk_okay_pn(value) -> bool:
     return bool(re.fullmatch(r"[\d\s\-]*", text))
 
 
+EXCLUDED_OKAY_PNS = {"4066M-01", "388M-01", "388-1P-03", "388-1P-02"}
+
+
 def consolidate_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     """Merge rows that share the same Okay PN, following the same rules as the
     original script: sum Total Revenue only when it differs across the group,
@@ -481,6 +484,7 @@ if st.session_state.get("loaded_sheet_key") != sheet_key:
             missing_report[sheet_name] = missing
             continue
         df = df[~df["Okay PN"].apply(is_junk_okay_pn)]
+        df = df[~df["Okay PN"].map(normalize_pn).isin(EXCLUDED_OKAY_PNS)]
         processed[sheet_name] = consolidate_duplicates(df)
 
     po_registry = load_po_registry()
