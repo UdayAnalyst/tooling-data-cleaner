@@ -244,7 +244,7 @@ def is_junk_okay_pn(value) -> bool:
     return bool(re.fullmatch(r"[\d\s\-]*", text))
 
 
-EXCLUDED_OKAY_PNS = {"4066M-01", "388M-01", "388-1P-03", "388-1P-02"}
+EXCLUDED_OKAY_PNS = {"4066M-01", "388M-01", "388-1P-03", "388-1P-02", "1/1/4243"}
 
 
 def consolidate_duplicates(df: pd.DataFrame) -> pd.DataFrame:
@@ -483,6 +483,7 @@ if st.session_state.get("loaded_sheet_key") != sheet_key:
         if missing:
             missing_report[sheet_name] = missing
             continue
+        df = df[df["Okay PN"].notna() & (df["Okay PN"].astype(str).str.strip() != "")]
         df = df[~df["Okay PN"].apply(is_junk_okay_pn)]
         df = df[~df["Okay PN"].map(normalize_pn).isin(EXCLUDED_OKAY_PNS)]
         processed[sheet_name] = consolidate_duplicates(df)
