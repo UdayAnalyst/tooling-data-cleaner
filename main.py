@@ -258,7 +258,7 @@ def consolidate_duplicates(df: pd.DataFrame) -> pd.DataFrame:
 
     for okay_pn in df_work["Okay PN"].unique():
         group_indices = df_work[df_work["Okay PN"] == okay_pn].index.tolist()
-        if len(group_indices) == 1:
+        if len(group_indices) <= 1:
             continue
 
         group = df_work.loc[group_indices]
