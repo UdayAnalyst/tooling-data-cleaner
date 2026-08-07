@@ -1,61 +1,34 @@
 import io
-import re
 
 import altair as alt
 import pandas as pd
 import streamlit as st
-from openpyxl.chart import BarChart, Reference
-from openpyxl.chart.series import DataPoint
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 
 from plex_data import (
-    fetch_plex_sheets,
+    add_totals_row,
+    build_daily_report_excel,
+    build_excel,
+    build_project_summary,
+    build_project_summary_excel,
+    clean_sheets,
+    derive_sheet_label,
+    extract_pn_prefix,
+    fetch_local_files,
+    fetch_plex_groups,
     get_credentials,
     get_or_create_worksheet,
+    is_local_export_configured,
     is_odbc_configured,
+    is_po_registry_configured,
     is_registry_configured,
+    load_all_sheets,
+    load_part_groups,
+    load_po_registry,
     load_project_registry,
+    normalize_pn,
     parse_part_numbers,
+    STATUS_COLORS,
 )
-
-STATUS_COLORS = {"Profit": "#0ca30c", "Loss": "#d03b3b"}
-STATUS_COLORS_HEX = {"Profit": "0CA30C", "Loss": "D03B3B"}  # no '#', for openpyxl
-
-PO_REGISTRY_HEADERS = ["Okay PN", "Total PO $"]
-
-
-def get_po_registry_worksheet():
-    return get_or_create_worksheet("PO Registry", PO_REGISTRY_HEADERS, rows=1000)
-
-
-def load_po_registry() -> dict[str, float]:
-    """Returns {Okay PN: Total PO $} remembered from previous days. Returns an
-    empty registry (rather than raising) if Google Sheets isn't configured, so
-    the app still works without it — see PO_REGISTRY_SETUP.md. Fetches
-    UNFORMATTED_VALUE so currency-formatted cells (e.g. '$174,827.00', or
-    '$ -' for zero — both just display formatting on an underlying number)
-    come back as plain numbers instead of strings that fail float(). Rows
-    with a genuinely blank/non-numeric Total PO $ (e.g. a new Okay PN added
-    by hand and not yet filled in) are skipped individually rather than
-    blanking the whole registry."""
-    try:
-        worksheet = get_po_registry_worksheet()
-        records = worksheet.get_all_records(value_render_option="UNFORMATTED_VALUE")
-    except Exception:
-        return {}
-
-    registry = {}
-    for r in records:
-        pn = str(r.get("Okay PN", "")).strip()
-        if not pn:
-            continue
-        try:
-            registry[normalize_pn(pn)] = float(r["Total PO $"])
-        except (KeyError, TypeError, ValueError):
-            continue
-    return registry
-
 
 GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -200,209 +173,6 @@ def log_open_projects_snapshot(open_projects: pd.DataFrame) -> bool:
 
 st.set_page_config(page_title="Tooling Data Cleaning & Budget Tool", layout="wide")
 
-REQUIRED_COLUMNS = [
-    "Tooling Line Item Description",
-    "Okay PN",
-    "Tooling Job No.",
-    "Total Revenue",
-    "Invoiced Revenue",
-    "Vendor POs Cost",
-    "Labor Cost",
-    "Total Cost",
-    "Profit or Loss",
-]
-
-SUM_COLS = ["Invoiced Revenue", "Vendor POs Cost", "Labor Cost", "Total Cost"]
-
-NUMERIC_TOTAL_COLS = [
-    "Total Revenue",
-    "Invoiced Revenue",
-    "Vendor POs Cost",
-    "Labor Cost",
-    "Total Cost",
-    "Profit or Loss",
-    "Total PO $",
-    "Budget Left",
-]
-
-
-def normalize_pn(value) -> str:
-    """Normalizes Okay PN for registry matching: trims whitespace, collapses
-    internal whitespace, strips a trailing dash (Plex exports sometimes add
-    one, e.g. '932 A PD-01-' vs '932 A PD-01'), and ignores case."""
-    text = re.sub(r"\s+", " ", str(value).strip().upper())
-    return text.rstrip("- ")
-
-
-def is_junk_okay_pn(value) -> bool:
-    """True for an Okay PN that's just a bare number/revision code with no
-    real description — e.g. '931-01', '924-1 -01', or a number plus a
-    standalone 'ASY' suffix like '938 ASY-01'. These rows get dropped during
-    cleaning. A PN with real text after ASY (e.g. '4243 ASY A MC-01-01') is
-    kept — only the first, whole-word 'ASY' is stripped before checking."""
-    text = re.sub(r"(?<![A-Z])ASY(?![A-Z])", "", str(value).strip().upper(), count=1)
-    return bool(re.fullmatch(r"[\d\s\-]*", text))
-
-
-EXCLUDED_OKAY_PNS = {"4066M-01", "388M-01", "388-1P-03", "388-1P-02", "1/1/4243"}
-
-
-def consolidate_duplicates(df: pd.DataFrame) -> pd.DataFrame:
-    """Merge rows that share the same Okay PN, following the same rules as the
-    original script: sum Total Revenue only when it differs across the group,
-    zero out the other cost/revenue columns on the extra rows (or sum them
-    onto the first row when they differ), then drop the extra rows."""
-    df_cleaned = df[REQUIRED_COLUMNS].copy()
-    df_work = df_cleaned.copy()
-    rows_to_drop = []
-
-    for okay_pn in df_work["Okay PN"].unique():
-        group_indices = df_work[df_work["Okay PN"] == okay_pn].index.tolist()
-        if len(group_indices) <= 1:
-            continue
-
-        group = df_work.loc[group_indices]
-        first_idx, other_indices = group_indices[0], group_indices[1:]
-
-        if len(group["Total Revenue"].unique()) != 1:
-            df_work.loc[first_idx, "Total Revenue"] = group["Total Revenue"].sum()
-
-        for col in SUM_COLS:
-            if len(group[col].unique()) == 1:
-                df_work.loc[other_indices, col] = 0
-            else:
-                df_work.loc[first_idx, col] = group[col].sum()
-
-        rows_to_drop.extend(other_indices)
-
-    df_cleaned = df_work.drop(rows_to_drop).reset_index(drop=True)
-    df_cleaned["Profit or Loss"] = df_cleaned["Total Revenue"] - df_cleaned["Total Cost"]
-    return df_cleaned
-
-
-def load_all_sheets(uploaded_files) -> dict[str, pd.DataFrame]:
-    sheets = {}
-    for uploaded_file in uploaded_files:
-        name = uploaded_file.name
-        if name.lower().endswith(".csv"):
-            sheets[name.rsplit(".", 1)[0]] = pd.read_csv(uploaded_file)
-        elif name.lower().endswith((".xlsx", ".xls")):
-            excel_file = pd.ExcelFile(uploaded_file)
-            for sheet in excel_file.sheet_names:
-                sheets[f"{name}_{sheet}"] = pd.read_excel(excel_file, sheet_name=sheet)
-    return sheets
-
-
-def add_totals_row(df: pd.DataFrame) -> pd.DataFrame:
-    totals = {col: (df[col].sum() if col in NUMERIC_TOTAL_COLS else "") for col in df.columns}
-    totals[df.columns[0]] = "TOTAL"
-    return pd.concat([df, pd.DataFrame([totals])], ignore_index=True)
-
-
-def extract_pn_prefix(value: str) -> str:
-    """Leading run of letters/digits, stopping at the first dash, dot, space,
-    underscore, etc. — e.g. '924-1' and '924-01' both become '924'."""
-    match = re.match(r"^[A-Za-z0-9]+", value)
-    return match.group(0) if match else value
-
-
-def derive_sheet_label(df: pd.DataFrame, fallback: str) -> str:
-    """Human-readable heading for a sheet, e.g. '932/4066', based on its Okay
-    PN prefixes — used instead of the raw uploaded filename, which is often an
-    auto-generated export name like 'Query_2026_07_10-09-12-16'. Falls back to
-    that filename if no prefixes can be derived (e.g. an empty sheet)."""
-    data_rows = df[df[df.columns[0]] != "TOTAL"]
-    prefixes = data_rows["Okay PN"].dropna().astype(str).map(extract_pn_prefix).unique()
-    return "/".join(prefixes) if len(prefixes) else fallback
-
-
-def build_project_summary(final_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """One row per uploaded file, reusing each file's existing TOTAL row from
-    Step 3. If a file contains multiple unique Tooling Job No. (or Okay PN
-    prefix) values, they are joined with '/'."""
-    rows = []
-    for sheet_name, df in final_sheets.items():
-        data_rows = df[df[df.columns[0]] != "TOTAL"]
-        totals_row = df.iloc[-1]
-        job_numbers = data_rows["Tooling Job No."].dropna().astype(str).unique()
-        pn_prefixes = data_rows["Okay PN"].dropna().astype(str).map(extract_pn_prefix).unique()
-
-        rows.append(
-            {
-                "File": sheet_name,
-                "Project": "/".join(pn_prefixes),
-                "Tooling Job No.": "/".join(job_numbers),
-                "Total PO $": totals_row["Total PO $"],
-                "Total Cost": totals_row["Total Cost"],
-            }
-        )
-
-    summary = pd.DataFrame(rows)
-    summary["Profit or Loss ($)"] = summary["Total PO $"] - summary["Total Cost"]
-    summary["Status"] = summary["Profit or Loss ($)"].apply(lambda v: "Profit" if v >= 0 else "Loss")
-    return summary
-
-
-def build_excel(final_sheets: dict[str, pd.DataFrame]) -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        for sheet_name, df_final in final_sheets.items():
-            df_final.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-    return buffer.getvalue()
-
-
-def build_project_summary_excel(project_summary: pd.DataFrame) -> bytes:
-    """Project summary table plus a native, editable Excel bar chart colored
-    green/red by Profit/Loss status."""
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        project_summary.to_excel(writer, sheet_name="Project Summary", index=False)
-        worksheet = writer.sheets["Project Summary"]
-        n_rows = len(project_summary)
-
-        header_fill = PatternFill("solid", fgColor="2A78D6")
-        for cell in worksheet[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center")
-
-        currency_cols = ["Total PO $", "Total Cost", "Profit or Loss ($)"]
-        for col_name in currency_cols:
-            col_letter = get_column_letter(project_summary.columns.get_loc(col_name) + 1)
-            for row in range(2, n_rows + 2):
-                worksheet[f"{col_letter}{row}"].number_format = '"$"#,##0.00'
-
-        for i, col_name in enumerate(project_summary.columns, start=1):
-            max_len = max(project_summary[col_name].astype(str).map(len).max(), len(col_name)) + 2
-            worksheet.column_dimensions[get_column_letter(i)].width = max_len
-
-        chart = BarChart()
-        chart.type = "col"
-        chart.title = "Profit or Loss by Project"
-        chart.y_axis.title = "Profit or Loss ($)"
-        chart.x_axis.title = "Project"
-        chart.legend = None
-        chart.height, chart.width = 10, 20
-
-        profit_col = project_summary.columns.get_loc("Profit or Loss ($)") + 1
-        project_col = project_summary.columns.get_loc("Project") + 1
-        data = Reference(worksheet, min_col=profit_col, min_row=1, max_row=n_rows + 1)
-        cats = Reference(worksheet, min_col=project_col, min_row=2, max_row=n_rows + 1)
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(cats)
-
-        series = chart.series[0]
-        series.data_points = [DataPoint(idx=i) for i in range(n_rows)]
-        for i, status in enumerate(project_summary["Status"]):
-            point = series.data_points[i]
-            point.graphicalProperties.solidFill = STATUS_COLORS_HEX[status]
-            point.graphicalProperties.line.noFill = True
-
-        worksheet.add_chart(chart, f"{get_column_letter(len(project_summary.columns) + 2)}2")
-
-    return buffer.getvalue()
-
-
 st.title("Tooling Data Cleaning & Budget Tool")
 
 if st.text_input("Enter access code to continue", type="password") != st.secrets.get("site_access_code"):
@@ -411,36 +181,38 @@ if st.text_input("Enter access code to continue", type="password") != st.secrets
 
 raw_sheets = None  # only (re)computed inside the change-gate below
 
-if is_odbc_configured():
-    st.caption(
-        "Data is queried directly from Plex. Enter one Part No. filter per row "
-        "below (e.g. 924) — add rows with the + at the bottom, or paste a whole "
-        "column of them straight from Excel — then click 'Fetch from Plex'."
-    )
+if is_local_export_configured():
+    header_col, button_col = st.columns([4, 1])
+    with header_col:
+        st.caption(
+            f"Files are read from the local Plex export folder ({st.secrets['plex_export_local_dir']}), "
+            "last written by the daily export."
+        )
+    with button_col:
+        if st.button("Refresh from local export"):
+            st.session_state.pop("local_files", None)
 
-    part_filters_df = st.data_editor(
-        pd.DataFrame({"Part No. Filter": [""]}),
-        key="part_filters_editor",
-        num_rows="dynamic",
-        hide_index=True,
-        use_container_width=True,
-    )
-    fetch_clicked = st.button("Fetch from Plex")
+    if "local_files" not in st.session_state:
+        st.session_state.local_files = fetch_local_files()
 
-    if fetch_clicked:
-        part_filters = [
-            str(v).strip() for v in part_filters_df["Part No. Filter"] if str(v).strip()
-        ]
-        if part_filters:
-            with st.spinner(f"Querying Plex for {len(part_filters)} Part No. filter(s)..."):
-                try:
-                    st.session_state.plex_sheets = fetch_plex_sheets(part_filters)
-                except Exception as e:
-                    st.error(f"Couldn't query Plex: {e}")
+    uploaded_files = st.session_state.local_files
+    if not uploaded_files:
+        st.info(f"No CSV/Excel files found in {st.secrets['plex_export_local_dir']}.")
+        st.stop()
+    sheet_key = [f.name for f in uploaded_files]
+elif is_odbc_configured():
+    st.caption("Data is queried directly from Plex, using the Part Number list from your Parts.xlsx.")
+
+    if st.button("Fetch from Plex"):
+        with st.spinner("Querying Plex..."):
+            try:
+                st.session_state.plex_sheets = fetch_plex_groups(load_part_groups())
+            except Exception as e:
+                st.error(f"Couldn't query Plex: {e}")
 
     raw_sheets = st.session_state.get("plex_sheets", {})
     if not raw_sheets:
-        st.info("Enter one or more Part No. filters above and click 'Fetch from Plex' to get started.")
+        st.info("Click 'Fetch from Plex' to get started.")
         st.stop()
     sheet_key = list(raw_sheets.keys())
 elif is_drive_configured():
@@ -476,20 +248,11 @@ else:
 if st.session_state.get("loaded_sheet_key") != sheet_key:
     if raw_sheets is None:
         raw_sheets = load_all_sheets(uploaded_files)
-    processed, missing_report = {}, {}
-
-    for sheet_name, df in raw_sheets.items():
-        missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-        if missing:
-            missing_report[sheet_name] = missing
-            continue
-        df = df[df["Okay PN"].notna() & (df["Okay PN"].astype(str).str.strip() != "")]
-        df = df[~df["Okay PN"].apply(is_junk_okay_pn)]
-        df = df[~df["Okay PN"].map(normalize_pn).isin(EXCLUDED_OKAY_PNS)]
-        processed[sheet_name] = consolidate_duplicates(df)
+    processed, missing_report = clean_sheets(raw_sheets)
 
     po_registry = load_po_registry()
     st.session_state.registry_connected = is_registry_configured()
+    st.session_state.po_registry_connected = is_po_registry_configured()
 
     st.session_state.loaded_sheet_key = sheet_key
     st.session_state.missing_report = missing_report
@@ -513,7 +276,7 @@ st.session_state.setdefault("registry_version", 0)
 step2_header, step2_button = st.columns([4, 1])
 with step2_header:
     st.header("Step 2: Total PO $ for each row")
-if st.session_state.get("registry_connected"):
+if st.session_state.get("po_registry_connected"):
     with step2_button:
         if st.button("Refresh from registry"):
             fresh_registry = load_po_registry()
@@ -524,12 +287,12 @@ if st.session_state.get("registry_connected"):
             st.session_state.registry_version += 1
             st.rerun()
     st.caption(
-        "'Total PO $' is locked here — it's pulled from your saved registry and can't be edited from "
-        "this website. Update values in the 'PO Registry' tab of your Google Sheet, then click "
+        "'Total PO $' is locked here — it's pulled from the local PO Registry file and can't be edited "
+        "from this website. Update values in secret sheet.xlsx's 'PO Registry' tab, then click "
         "'Refresh from registry' to pull the latest values in without needing to re-upload."
     )
 else:
-    st.caption("'Total PO $' is locked and shown read-only — it can only be set via the Google Sheet registry.")
+    st.caption("'Total PO $' is locked and shown read-only — it can only be set via the local PO Registry file.")
     st.warning(
         "PO $ registry isn't connected yet, so values aren't being remembered day to day. "
         "See PO_REGISTRY_SETUP.md to enable it."

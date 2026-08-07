@@ -5,10 +5,16 @@ as it's imported, so it can't be imported directly from a non-Streamlit
 script — this module only defines functions/constants and has no top-level
 Streamlit UI calls, so it's safe to import from either."""
 
+import io
 import re
 
 import pandas as pd
 import streamlit as st
+from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.series import DataPoint
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 GSHEET_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -242,8 +248,352 @@ def fetch_plex_job(part_no_filter: str) -> pd.DataFrame:
         conn.close()
 
 
-def fetch_plex_sheets(part_filters: list[str]) -> dict[str, pd.DataFrame]:
-    """Runs the Plex query once per Part No. filter, returning {filter: DataFrame}
-    — each entry plugs straight into the same cleaning/PO/final-results
-    pipeline that a parsed upload sheet would."""
-    return {part_no: fetch_plex_job(part_no) for part_no in part_filters}
+def load_part_groups() -> list[list[str]]:
+    """Part No. filters to fetch from Plex, read from the Parts.xlsx list
+    (st.secrets["parts_list_path"]). A row like '985/931/988/930/931M' is one
+    family — each number is queried separately but merged into a single
+    sheet, the same '/'-joined convention used for labels in main.py (see
+    derive_sheet_label). Shared by main.py (interactive fetch) and
+    daily_plex_export.py (scheduled export) so both group families the same way."""
+    df = pd.read_excel(st.secrets["parts_list_path"])
+    values = df.iloc[:, 0].dropna().astype(str).str.strip()
+    return [v.split("/") for v in values if v]
+
+
+def fetch_plex_groups(groups: list[list[str]]) -> dict[str, pd.DataFrame]:
+    """Runs one Plex query per Part No. in each group, concatenating a
+    multi-member group (a family) into a single sheet keyed by the
+    '/'-joined label instead of one sheet per number."""
+    sheets = {}
+    for group in groups:
+        dfs = [fetch_plex_job(part_no) for part_no in group]
+        sheets["/".join(group)] = pd.concat(dfs, ignore_index=True) if len(dfs) > 1 else dfs[0]
+    return sheets
+
+
+# Data cleaning + report building — shared by main.py (interactive app) and
+# daily_email_report.py (scheduled daily email), so both produce identical
+# cleaned/reported output from the same raw Plex export files.
+
+STATUS_COLORS = {"Profit": "#0ca30c", "Loss": "#d03b3b"}
+STATUS_COLORS_HEX = {"Profit": "0CA30C", "Loss": "D03B3B"}  # no '#', for openpyxl
+
+REQUIRED_COLUMNS = [
+    "Tooling Line Item Description",
+    "Okay PN",
+    "Tooling Job No.",
+    "Total Revenue",
+    "Invoiced Revenue",
+    "Vendor POs Cost",
+    "Labor Cost",
+    "Total Cost",
+    "Profit or Loss",
+]
+
+SUM_COLS = ["Invoiced Revenue", "Vendor POs Cost", "Labor Cost", "Total Cost"]
+
+NUMERIC_TOTAL_COLS = [
+    "Total Revenue",
+    "Invoiced Revenue",
+    "Vendor POs Cost",
+    "Labor Cost",
+    "Total Cost",
+    "Profit or Loss",
+    "Total PO $",
+    "Budget Left",
+]
+
+EXCLUDED_OKAY_PNS = {
+    "4066M-01",
+    "388M-01",
+    "388-1P-03",
+    "388-1P-02",
+    "1/1/4243",
+    "4066 CHG-01",
+    "4066 P CHG",
+    "4243 CHG-01",
+    "4304-P CHG-01",
+    "938 ASY CHG",
+    "939 ASY CHG",
+    "985 ASY CHG",
+    "931 CHG",
+    "988 ASY CHG",
+    "930 CHG",
+    "930M",
+    "931M",
+    "388-1P-01",
+}
+
+
+def normalize_pn(value) -> str:
+    """Normalizes Okay PN for registry matching: trims whitespace, collapses
+    internal whitespace, strips a trailing dash (Plex exports sometimes add
+    one, e.g. '932 A PD-01-' vs '932 A PD-01'), and ignores case."""
+    text = re.sub(r"\s+", " ", str(value).strip().upper())
+    return text.rstrip("- ")
+
+
+def is_junk_okay_pn(value) -> bool:
+    """True for an Okay PN that's just a bare number/revision code with no
+    real description — e.g. '931-01', '924-1 -01', or a number plus a
+    standalone 'ASY' suffix like '938 ASY-01'. These rows get dropped during
+    cleaning. A PN with real text after ASY (e.g. '4243 ASY A MC-01-01') is
+    kept — only the first, whole-word 'ASY' is stripped before checking."""
+    text = re.sub(r"(?<![A-Z])ASY(?![A-Z])", "", str(value).strip().upper(), count=1)
+    return bool(re.fullmatch(r"[\d\s\-]*", text))
+
+
+def consolidate_duplicates(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge rows that share the same Okay PN, following the same rules as the
+    original script: sum Total Revenue only when it differs across the group,
+    zero out the other cost/revenue columns on the extra rows (or sum them
+    onto the first row when they differ), then drop the extra rows."""
+    df_cleaned = df[REQUIRED_COLUMNS].copy()
+    df_work = df_cleaned.copy()
+    rows_to_drop = []
+
+    for okay_pn in df_work["Okay PN"].unique():
+        group_indices = df_work[df_work["Okay PN"] == okay_pn].index.tolist()
+        if len(group_indices) <= 1:
+            continue
+
+        group = df_work.loc[group_indices]
+        first_idx, other_indices = group_indices[0], group_indices[1:]
+
+        if len(group["Total Revenue"].unique()) != 1:
+            df_work.loc[first_idx, "Total Revenue"] = group["Total Revenue"].sum()
+
+        for col in SUM_COLS:
+            if len(group[col].unique()) == 1:
+                df_work.loc[other_indices, col] = 0
+            else:
+                df_work.loc[first_idx, col] = group[col].sum()
+
+        rows_to_drop.extend(other_indices)
+
+    df_cleaned = df_work.drop(rows_to_drop).reset_index(drop=True)
+    df_cleaned["Profit or Loss"] = df_cleaned["Total Revenue"] - df_cleaned["Total Cost"]
+    return df_cleaned
+
+
+def load_all_sheets(uploaded_files) -> dict[str, pd.DataFrame]:
+    sheets = {}
+    for uploaded_file in uploaded_files:
+        name = uploaded_file.name
+        if name.lower().endswith(".csv"):
+            sheets[name.rsplit(".", 1)[0]] = pd.read_csv(uploaded_file)
+        elif name.lower().endswith((".xlsx", ".xls")):
+            excel_file = pd.ExcelFile(uploaded_file)
+            for sheet in excel_file.sheet_names:
+                sheets[f"{name}_{sheet}"] = pd.read_excel(excel_file, sheet_name=sheet)
+    return sheets
+
+
+def clean_sheets(raw_sheets: dict[str, pd.DataFrame]) -> tuple[dict[str, pd.DataFrame], dict[str, list[str]]]:
+    """Runs every raw sheet through the same drop-junk/exclude/dedup pipeline
+    main.py uses after loading: returns (cleaned sheets, {sheet: missing
+    columns} for any sheet skipped for lacking REQUIRED_COLUMNS)."""
+    processed, missing_report = {}, {}
+    for sheet_name, df in raw_sheets.items():
+        missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+        if missing:
+            missing_report[sheet_name] = missing
+            continue
+        df = df[df["Okay PN"].notna() & (df["Okay PN"].astype(str).str.strip() != "")]
+        df = df[~df["Okay PN"].apply(is_junk_okay_pn)]
+        df = df[~df["Okay PN"].map(normalize_pn).isin(EXCLUDED_OKAY_PNS)]
+        processed[sheet_name] = consolidate_duplicates(df)
+    return processed, missing_report
+
+
+def is_po_registry_configured() -> bool:
+    """True when the local PO Registry file (st.secrets["po_registry_local_path"])
+    is configured — the source of truth for Total PO $, independent of Google
+    Sheets (which still backs Project Registry/History)."""
+    try:
+        return "po_registry_local_path" in st.secrets
+    except Exception:
+        return False
+
+
+def load_po_registry() -> dict[str, float]:
+    """Returns {Okay PN: Total PO $}, read from the 'PO Registry' tab of the
+    local Excel file at st.secrets["po_registry_local_path"] — an exact local
+    mirror of the (now retired) Google Sheet registry. Returns an empty
+    registry (rather than raising) if the file isn't configured/reachable, so
+    the app still works without it — see PO_REGISTRY_SETUP.md."""
+    try:
+        df = pd.read_excel(st.secrets["po_registry_local_path"], sheet_name="PO Registry")
+    except Exception:
+        return {}
+
+    registry = {}
+    for _, r in df.iterrows():
+        pn = str(r.get("Okay PN", "")).strip()
+        if not pn:
+            continue
+        try:
+            registry[normalize_pn(pn)] = float(r["Total PO $"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return registry
+
+
+def is_local_export_configured() -> bool:
+    """True when a local Plex export folder is configured (the same folder
+    daily_plex_export.py writes to, Drive-synced to the Cloud deployment's
+    source folder) — lets this machine read the already-downloaded files
+    directly off disk instead of a live Plex query or a Drive API round-trip
+    for a copy that's already sitting locally."""
+    try:
+        return "plex_export_local_dir" in st.secrets
+    except Exception:
+        return False
+
+
+def fetch_local_files():
+    """CSV/Excel files already written by daily_plex_export.py into the local
+    Drive-synced export folder. Path objects are a drop-in for load_all_sheets
+    (same .name attribute, pd.read_csv/pd.ExcelFile both accept a Path)."""
+    from pathlib import Path
+
+    folder = Path(st.secrets["plex_export_local_dir"])
+    return sorted(p for p in folder.glob("*") if p.suffix.lower() in (".csv", ".xlsx", ".xls"))
+
+
+def add_totals_row(df: pd.DataFrame) -> pd.DataFrame:
+    totals = {col: (df[col].sum() if col in NUMERIC_TOTAL_COLS else "") for col in df.columns}
+    totals[df.columns[0]] = "TOTAL"
+    return pd.concat([df, pd.DataFrame([totals])], ignore_index=True)
+
+
+def extract_pn_prefix(value: str) -> str:
+    """Leading run of letters/digits, stopping at the first dash, dot, space,
+    underscore, etc. — e.g. '924-1' and '924-01' both become '924'."""
+    match = re.match(r"^[A-Za-z0-9]+", value)
+    return match.group(0) if match else value
+
+
+def derive_sheet_label(df: pd.DataFrame, fallback: str) -> str:
+    """Human-readable heading for a sheet, e.g. '932/4066', based on its Okay
+    PN prefixes — used instead of the raw uploaded filename, which is often an
+    auto-generated export name like 'Query_2026_07_10-09-12-16'. Falls back to
+    that filename if no prefixes can be derived (e.g. an empty sheet)."""
+    data_rows = df[df[df.columns[0]] != "TOTAL"]
+    prefixes = data_rows["Okay PN"].dropna().astype(str).map(extract_pn_prefix).unique()
+    return "/".join(prefixes) if len(prefixes) else fallback
+
+
+def build_project_summary(final_sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """One row per uploaded file, reusing each file's existing TOTAL row from
+    Step 3. If a file contains multiple unique Tooling Job No. (or Okay PN
+    prefix) values, they are joined with '/'."""
+    rows = []
+    for sheet_name, df in final_sheets.items():
+        data_rows = df[df[df.columns[0]] != "TOTAL"]
+        totals_row = df.iloc[-1]
+        job_numbers = data_rows["Tooling Job No."].dropna().astype(str).unique()
+        pn_prefixes = data_rows["Okay PN"].dropna().astype(str).map(extract_pn_prefix).unique()
+
+        rows.append(
+            {
+                "File": sheet_name,
+                "Project": "/".join(pn_prefixes),
+                "Tooling Job No.": "/".join(job_numbers),
+                "Total PO $": totals_row["Total PO $"],
+                "Total Cost": totals_row["Total Cost"],
+            }
+        )
+
+    summary = pd.DataFrame(rows)
+    summary["Profit or Loss ($)"] = summary["Total PO $"] - summary["Total Cost"]
+    summary["Status"] = summary["Profit or Loss ($)"].apply(lambda v: "Profit" if v >= 0 else "Loss")
+    return summary
+
+
+def build_excel(final_sheets: dict[str, pd.DataFrame]) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for sheet_name, df_final in final_sheets.items():
+            df_final.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    return buffer.getvalue()
+
+
+def _write_project_summary_sheet(writer, project_summary: pd.DataFrame) -> None:
+    """Writes the 'Project Summary' sheet (styled header, currency formatting,
+    column widths, and a colored Profit/Loss bar chart) into an already-open
+    ExcelWriter — shared by build_project_summary_excel (standalone download)
+    and build_daily_report_excel (combined email attachment)."""
+    project_summary.to_excel(writer, sheet_name="Project Summary", index=False)
+    worksheet = writer.sheets["Project Summary"]
+    n_rows = len(project_summary)
+
+    header_fill = PatternFill("solid", fgColor="2A78D6")
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    currency_cols = ["Total PO $", "Total Cost", "Profit or Loss ($)"]
+    for col_name in currency_cols:
+        col_letter = get_column_letter(project_summary.columns.get_loc(col_name) + 1)
+        for row in range(2, n_rows + 2):
+            worksheet[f"{col_letter}{row}"].number_format = '"$"#,##0.00'
+
+    for i, col_name in enumerate(project_summary.columns, start=1):
+        max_len = max(project_summary[col_name].astype(str).map(len).max(), len(col_name)) + 2
+        worksheet.column_dimensions[get_column_letter(i)].width = max_len
+
+    chart = BarChart()
+    chart.type = "col"
+    chart.title = "Profit or Loss by Project"
+    chart.y_axis.title = "Profit or Loss ($)"
+    chart.x_axis.title = "Project"
+    chart.legend = None
+    chart.height, chart.width = 10, 20
+
+    profit_col = project_summary.columns.get_loc("Profit or Loss ($)") + 1
+    project_col = project_summary.columns.get_loc("Project") + 1
+    data = Reference(worksheet, min_col=profit_col, min_row=1, max_row=n_rows + 1)
+    cats = Reference(worksheet, min_col=project_col, min_row=2, max_row=n_rows + 1)
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(cats)
+
+    series = chart.series[0]
+    # Excel's default "invert if negative" recolors negative (Loss) bars with
+    # its own automatic shade, silently overriding the dPt.solidFill below —
+    # this is why the red never showed up. Must be off before setting colors.
+    series.invertIfNegative = False
+    series.data_points = [DataPoint(idx=i) for i in range(n_rows)]
+    for i, status in enumerate(project_summary["Status"]):
+        point = series.data_points[i]
+        point.graphicalProperties.solidFill = STATUS_COLORS_HEX[status]
+        point.graphicalProperties.line.noFill = True
+
+    series.dLbls = DataLabelList()
+    series.dLbls.showVal = True
+    series.dLbls.numFmt = '"$"#,##0'
+
+    worksheet.add_chart(chart, f"{get_column_letter(len(project_summary.columns) + 2)}2")
+
+
+def build_project_summary_excel(project_summary: pd.DataFrame) -> bytes:
+    """Project summary table plus a native, editable Excel bar chart colored
+    green/red by Profit/Loss status."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        _write_project_summary_sheet(writer, project_summary)
+    return buffer.getvalue()
+
+
+def build_daily_report_excel(final_sheets: dict[str, pd.DataFrame], project_summary: pd.DataFrame) -> bytes:
+    """Everything build_excel + build_project_summary_excel produce,
+    combined into one workbook: one sheet per cleaned project plus a
+    'Project Summary' sheet with its chart — used for the daily email
+    attachment."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for sheet_name, df_final in final_sheets.items():
+            df_final.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+        _write_project_summary_sheet(writer, project_summary)
+    return buffer.getvalue()
